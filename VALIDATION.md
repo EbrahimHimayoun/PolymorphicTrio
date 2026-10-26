@@ -1,0 +1,122 @@
+# CHAMELEON allocation and readability update
+
+`resize(source, target_canvas)` and the official rendering pipeline are unchanged.
+The engine still runs offline using the installed dependencies and local fonts.
+
+## Rules used
+
+- `PREFERRED_TEXT_SIZES` in `engine/resize.py` configures soft output-pixel
+  preferences: prominent 14px, ordinary 11px, confidently secondary 9px,
+  confidently inferred footer 7px. These are engineering choices, not official
+  challenge limits. `readability_report(source, output)` exposes actual sizes
+  and shortfalls without adding fields to the design schema.
+- Importance uses source font sizes, box geometry and group relationships.
+  Footer inference requires small source typography, a thin box and bottom-edge
+  placement. Ambiguous text gets the ordinary preference. IDs, asset names,
+  sample notes and text wording do not determine roles.
+- Candidates include the existing layouts, content-weighted unequal columns,
+  image/text/control lanes, compact rows of simple buttons and a full-width
+  footer strip when confidently inferred. Measured text demand and image
+  proportions influence column widths. Individual units use different scales
+  according to importance and pressure; gaps can contract.
+- Simple rectangle/label pairs resize padding and background together. Rotated
+  pairs flex only with centered text, a shared angle and a shared pivot.
+  Other groups remain rigid. Clear source font hierarchy contributes to scoring
+  and limits subsequent growth of less prominent text.
+- After selection, a growth pass explores free rectangles, measures complete
+  wrapped text and checks the whole foreground layout before accepting changes.
+  It preserves alignment and rejects new overlaps, clipping and line-cap failures.
+- Decorations follow imagery only with substantial, unambiguous source overlap
+  and lower stacking order. Other decorations retain canvas-relative anchors.
+  Placement evaluates text occlusion without changing opacity or colors.
+- Nearby-ratio layouts that already work retain the existing visual baseline.
+
+## Verification performed
+
+Commands used the existing `.venv312/bin/python` interpreter; no environments
+or dependencies were modified:
+
+```sh
+.venv312/bin/python -m engine.main
+.venv312/bin/python -m unittest discover -s tests -v
+```
+
+All three samples rendered through the official renderer with no self-check
+warnings. All 12 tests passed. They cover four additional formats per sample
+(400×1600, 900×900, 1920×1080, 1200×180), renamed element/group IDs, source
+immutability, element count/properties/assets, proportional foreground images,
+text fit with official glyph advances and wrapping, and bounds independently
+computed by rotating all four corners. Additional fixtures cover feasible
+preferences, configurable preferences, accurate shortfall reporting without requiring any shortfall, known hierarchy,
+equal-size source typography, growth without new collisions, grouped button
+containment, uncertain rotated groups, decoration association, missing-image allocation and 36 elements.
+Intentional label/background overlaps are allowed.
+
+Before/after native-size PNG comparisons were inspected. Level 1's output JSON
+is identical to its saved baseline, and its PNG is pixel-identical. Level 2 keeps
+its main arrangement, with slightly tighter measured text boxes and decorations
+moved away from foreground text. The largest visible improvement is Level 3.
+
+Level 3 output at 728×90 (actual font sizes, rounded):
+
+| Text | Before | After | Preferred |
+| --- | ---: | ---: | ---: |
+| Largest source text | 8.28 | 12.22 | 14 |
+| Supporting copy | 4.55 | 9.43 | 11 |
+| CTA label | 4.55 | 10.16 | 11 |
+| Three compact labels | 3.10 each | 6.98 / 6.44 / 6.98 | 9 |
+| Bottom small print | 2.48 | 6.74 | 7 |
+| Rotated label | 4.14 | 9.18 | 11 |
+
+Generated previews and diagnostics are in `output/validation/`, including
+`readability.json` and `*_comparison.png`. These are development artifacts;
+`engine.main` continues to write its normal JSON/PNG pairs.
+
+## Final cleanup verification
+
+The constrained-sample test no longer requires a readability shortfall: a future
+layout may achieve every preferred size. It still checks that every reported
+shortfall is exactly `max(0, preferred - font_size)`, validates the output and
+retains the largest-source-text readability regression check. Other tests were
+retained, and a missing-image allocation fixture checks preserved references,
+substantial proportional dimensions and collision-free growth.
+
+The small red/white box was confirmed in `renderer/converter/assets.py`:
+`load_asset_image()` calls `_placeholder()` when the referenced file is absent.
+The deliberately absent `solstice_holiday_badge_2025.png` remains referenced by
+the original `holiday_watermark` element. No renderer or asset files changed.
+The border, background and diagnostic label are generated by the official
+renderer; changing/suppressing them or inventing artwork would violate this
+task's preservation instructions. Only layout geometry is adjusted.
+
+General missing-asset handling offers a candidate grouping wide visual units,
+then expands/repositions unresolved standalone images into nearby free space.
+The placeholder moved from below the CTA to the left visual lane, increasing
+from about 26.34×11.71px to 47.70×21.20px. It has a clearance gap from the other
+foreground elements, including the CTA and legal text. The filename diagnostic
+still clips inside its proportional box; the official appearance is retained.
+Grouped images are not moved independently of their associated content.
+
+The final tests and all three sample renders were rerun using
+`.venv312/bin/python`; all 12 tests passed and all sample self-checks reported
+OK. All three native-size PNGs were inspected. Levels 1 and 2 are pixel-identical
+to their pre-cleanup outputs. The revised Level 3 values above replace the prior
+measurements; its CTA gains space, with small tradeoffs in other text sizes.
+Docker verification remains pending. No environments or dependencies were changed.
+
+## Remaining limits
+
+At 728×90 some copy is still very small, despite substantial improvement. The
+current candidate search does not reach every preferred size while retaining
+all content and the source hierarchy. This is a measured shortfall, not proof
+of an optimal layout or mathematical impossibility. Image regions also become
+small. The deliberately missing asset still uses the official placeholder.
+
+Role and decoration inference are conservative heuristics. Unequal widths use
+sampled allocations rather than a global solver, so complex editorial layouts
+can still leave usable space. Growth is greedy and can miss improvements that
+would require moving several neighbors together. Bounds/collision checks use
+conservative rotated bounding rectangles, which can reject safe arrangements
+between rotated shapes. Extremely small canvases or excessive copy may remain
+unreadable even at schema-valid sizes; nothing is hidden or removed to claim
+otherwise. Docker validation was not performed in this change.

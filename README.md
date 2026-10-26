@@ -1,99 +1,157 @@
-# CHAMELEON — starter repo
+# CHAMELEON — offline design resizing
 
-This is the scaffolding for your engine. It handles input loading, output
-writing, rendering, and Docker packaging — so the only file you need to
-edit is **`engine/resize.py`**.
+CHAMELEON rearranges an existing design's text, images and shapes for a new
+canvas size or aspect ratio. It moves and reflows content instead of stretching
+the entire design. It preserves element IDs/count, text, font families, colors
+and image assets, while adjusting placement, dimensions and font sizes.
 
-```
-input:  a task JSON (source design + target canvas)
-              |
-              v
-        engine/resize.py   <-- YOU IMPLEMENT THIS
-              |
-              v
-output: <task>_output.json  (schema-valid resized design)
-        <task>_output.png   (rendered preview)
-```
+The phase-one engine deliverable is a working `resize(source, target_canvas)`
+implementation producing resized design JSON and a PNG through the official
+renderer. Both artifacts are evaluated; structural validity alone does not
+prove visual quality. The starter FAQ also describes a required viewer add-on;
+this repository's engine does not implement that viewer. See [RULES.md](RULES.md)
+and [FAQ.md](FAQ.md) for submission context.
 
-Both the JSON and the PNG are what get evaluated — see `RULES.md`.
-
-## Repo layout
-
-```
-engine/
-  resize.py        <- implement your approach here
-  main.py           <- orchestrator (input -> resize() -> output). Don't need to edit this.
-renderer/           <- the real renderer (transformer-convertor + cr-renderer), already vendored
-brand_kit/
-  assets/           <- image files referenced by asset_id in the sample designs
-  fonts/            <- font files matching the schema's font_family values
-input/               <- drop task JSON files here for local testing (3 samples included)
-output/              <- results land here
-chameleon_design_schema_v0.9.json   <- full field-by-field spec for the design format
-Dockerfile
-RULES.md
+```text
+input/*.json  (source design + target canvas)
+       |
+       v
+engine/main.py -> engine/resize.py -> official renderer
+       |
+       v
+output/<task>_output.json
+output/<task>_output.png
 ```
 
-## Quick start (no Docker needed for iterating on `resize()`)
+## Current approach
 
-```bash
-pip install -r requirements.txt
+The engine is rule-based Python. No AI model, online API or model download is
+required. Runtime uses local brand fonts/assets and installed dependencies.
+
+It compares source-preserving layouts, vertical stacks, equal/unequal columns,
+and visual/text/control lanes. Unequal widths account for measured text needs
+and image proportions. Importance is inferred conservatively from source
+font sizes, geometry and relationships, rather than IDs, asset names or notes.
+Units receive different scales according to importance and space pressure.
+
+Simple text/rectangle groups can compact or share rows, resizing padding and
+background together. Clearly aligned rotated pairs can flex; uncertain groups
+remain rigid. A text-growth pass explores available rectangles, measures the
+complete wrapped text, and rejects growth that clips or creates new collisions.
+Decorations use source overlap evidence or canvas-relative anchors.
+
+`PREFERRED_TEXT_SIZES` in `engine/resize.py` defines soft readability preferences:
+14px prominent, 11px ordinary, 9px confidently secondary, and 7px confidently
+inferred footer text. These are engineering preferences, **not official limits**.
+Shortfalls influence scoring and can be inspected with
+`readability_report(source, output)`; they do not authorize dropping content.
+The candidate search and greedy growth pass do not guarantee an optimal layout.
+
+## Repository layout
+
+```text
+engine/resize.py                   layout implementation
+engine/main.py                     input/output orchestration and self-check
+renderer/                          official converter and rendering integration
+brand_kit/assets/                  original image assets
+brand_kit/fonts/                   local brand fonts
+input/                             task JSON files (three samples included)
+output/                            generated JSON and PNG previews (ignored by git)
+tests/                             invariant/allocation tests and baseline fixture
+chameleon_design_schema_v0.9.json   design format
+RULES.md                           evaluation rules
+VALIDATION.md                      measured results and known limitations
+Dockerfile                         container entrypoint
+```
+
+## Python setup and local run
+
+Use **Python 3.10 or newer**; the Dockerfile uses 3.11 and local validation uses
+3.12. From the repository root, create and activate a virtual environment:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 python -m engine.main
 ```
 
-This processes every `*.json` file in `input/` (the 3 sample designs are
-already there — one per difficulty level) and writes an `_output.json` and
-`_output.png` for each into `output/`.
+Installation needs access to download dependencies, including `cr-renderer`
+from GitHub (Git must be available). Once installed, the engine runs offline.
+Do not install dependencies during an offline run.
 
-The included baseline is a **uniform stretch** — deliberately the wrong
-approach (see the main brief: "a naive program stretches the picture; a
-good one moves the furniture"). It's there so the pipeline runs on day
-one. Run it once, look at `output/*_output.png`, and you'll see exactly
-why it's not good enough — that's the point. Replace the body of
-`resize()` in `engine/resize.py`, not just its constants.
+Optional example for the existing local Python 3.12 environment:
 
-## What the self-check does (and doesn't do)
+```sh
+source .venv312/bin/activate
+python -m engine.main
+```
 
-`main.py` runs a quick structural check after every task — same element
-`id`s as the source, required fields present, nothing off-canvas. **This
-is not the official scorer.** It exists to catch obvious mistakes before
-you waste a submission on them. See `RULES.md` for what's actually
-checked and graded.
+Or invoke that interpreter without activation:
 
-A self-check warning does not fail the run — your JSON and PNG are still
-written either way. Read the warning; decide whether it's a real problem
-or, like the Level 2 sample's intentionally corner-bleeding decorative
-circle, an expected one.
+```sh
+.venv312/bin/python -m engine.main
+.venv312/bin/python -m unittest discover -s tests -v
+```
 
-## The renderer
+The standard test command in an activated environment is:
 
-`main.py` calls `renderer/converter/convert.py`'s `render_design_to_png()`
-(a vendored copy of `transformer-convertor`, wrapping `cr-renderer`) to
-produce each task's PNG — already wired in, no setup needed. It reads
-fonts/assets from `brand_kit/` and writes a real rendered preview, not a
-placeholder. If you ever see plain labeled boxes instead of real text and
-images in `output/*.png`, that means the import in `main.py` failed (e.g.
-`cr-renderer` didn't install — check `requirements.txt` installed cleanly)
-and it silently fell back to the box-and-label placeholder; don't judge
-your layout quality by that fallback.
+```sh
+python -m unittest discover -s tests -v
+```
 
-## Docker (how you'll actually be run)
+The runner processes every `*.json` task in `input/` and writes an
+`_output.json` and `_output.png` pair to `output/`. Keep the JSON and inspect
+the rendered PNG at its intended display size. Tests check independent rotated
+bounds, preserved properties/assets, image proportions, renderer-compatible text
+fit, overlaps, hierarchy, readability preferences and allocation regressions.
+Detailed results are in [VALIDATION.md](VALIDATION.md).
 
-```bash
+## Renderer and self-check
+
+`engine/main.py` calls `renderer/converter/convert.py`'s
+`render_design_to_png()`, which uses `cr-renderer` and local brand fonts/assets.
+If importing the official renderer fails, the runner falls back to labeled
+boxes. That fallback checks plumbing only; do not use it to judge layout quality.
+
+The runner's self-check flags missing required fields, changed IDs and elements
+off canvas. It is not the official scorer and does not establish text readability
+or layout quality. The test suite adds checks, but cannot certify every input.
+
+The Level 3 input deliberately references an absent asset:
+`solstice_holiday_badge_2025.png`. The official renderer draws a red-bordered
+missing-asset placeholder. The engine preserves that element and its asset ID,
+tries a visual lane suited to its proportions, and expands/repositions standalone
+missing images into collision-free space when possible. It does not remove the
+placeholder, invent replacement artwork, or alter the renderer's appearance.
+
+## Docker build and offline run
+
+From the repository root:
+
+```sh
 docker build --platform linux/amd64 -t my-chameleon-engine .
 docker run --rm --network none \
-  -v $(pwd)/input:/app/input \
-  -v $(pwd)/output:/app/output \
+  -v "$(pwd)/input:/app/input" \
+  -v "$(pwd)/output:/app/output" \
   my-chameleon-engine
 ```
 
-`--network none` matches how stage-one scoring runs: everything your
-engine needs must be installed at **build** time (add it to
-`requirements.txt`), not fetched at run time. If you're using a locally
-hosted model, bake its weights into the image during the build step.
+Build-time dependency installation needs network access. `--network none` models
+the offline scoring run: all runtime dependencies, fonts and assets must already
+be in the image. **Docker verification is pending**; the documented validation
+was performed locally using `.venv312/bin/python`.
 
-## See also
+## Known limitations
 
-- `chameleon_design_schema_v0.9.json` — full input/output field spec
-- `RULES.md` — what's checked, what's graded, and what disqualifies a submission
-- FAQ — for anything not covered above
+Extreme formats can still require tiny text and image regions even though every
+element fits. Preferred font sizes are soft targets, and the engine may report
+shortfalls. Geometry-based roles and grouping are heuristic; sampled column
+widths and greedy growth can miss better arrangements. Rotation checks use
+conservative enclosing rectangles. The deliberately missing asset's official
+placeholder remains visible, and its diagnostic label may be clipped within
+small proportional boxes. JSON validity does not imply universal readability.
+
+See [VALIDATION.md](VALIDATION.md) for actual font sizes, verified checks and
+remaining limitations, and the [design schema](chameleon_design_schema_v0.9.json)
+for the input/output contract.

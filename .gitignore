@@ -8,6 +8,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv*/
 venv/
 
 # cr-renderer is a separate, external open-source project
@@ -20,3 +21,9 @@ venv/
 # Generated run artifacts
 output/*
 !output/.gitkeep
+
+# Local credentials and environment files
+.aws/
+.env
+.env.*
+!.env.example
