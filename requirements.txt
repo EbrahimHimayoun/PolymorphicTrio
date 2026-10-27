@@ -1,2 +1,49 @@
-Pillow>=10.0
-git+https://github.com/CyberAgentAILab/cr-renderer
+# Fully pinned so the image builds identically every time (resolved for
+# python:3.11-slim on linux/amd64). Everything installs at BUILD time; the
+# container needs no network at run time (stage-one scoring uses --network none).
+#
+# cr-renderer is pinned to an exact upstream commit: an unpinned git HEAD could
+# change rendering (or break the build) between your test and the judges' run.
+cr-renderer @ git+https://github.com/CyberAgentAILab/cr-renderer@a17e1fb9a732959dd6c21ae168d5ee09d74bd64f
+Pillow==13.0.0
+skia-python==144.1
+numpy==2.4.6
+pybind11==3.1.0
+
+# cr-renderer's own dependencies (imported, never used for network access).
+datasets==5.1.0
+pydantic==2.14.1
+pydantic_core==2.50.1
+huggingface_hub==2.3.0
+fsspec==2026.7.0
+pyarrow==26.0.0
+pandas==3.1.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+annotated-types==0.8.0
+anyio==4.15.1
+attrs==26.1.0
+click==8.5.0
+dill==0.4.1
+filelock==4.2.4
+frozenlist==1.8.0
+h11==0.16.0
+hf-xet==1.7.0
+httpcore2==2.16.0
+httpx2==2.16.0
+idna==3.20
+multidict==7.2.1
+multiprocess==0.70.19
+packaging==26.3
+propcache==0.5.4
+python-dateutil==3.0.0
+PyYAML==6.0.3
+six==1.17.0
+tqdm==4.70.1
+truststore==0.10.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzdata==2026.5
+xxhash==4.0.2
+yarl==1.25.1
