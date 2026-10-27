@@ -47,6 +47,7 @@ style values (corner radius, stroke width, letter spacing) are.
 from __future__ import annotations
 
 import heapq
+import itertools
 import math
 from functools import lru_cache
 from pathlib import Path
@@ -1039,7 +1040,8 @@ def _shift(block, dx, dy, out):
 
 class Opts:
     def __init__(self, compact=False, r=1.0, r_logo=1.0, per_row=None, fine_strip=False, q=1.0,
-                 grid_per=None):
+                 grid_per=None, sizes=None):
+        self.sizes = sizes if sizes is not None else {}  # explicit size per unit uid (zones)
         self.q = q  # pressure multiplier for action-lane pills and floaters
         self.grid_per = grid_per  # visuals per row in a grid piece (None: one row)
         self.compact = compact
@@ -1070,11 +1072,11 @@ def _make_piece(ctx, piece, p, opts, width, hmax):
     kind, payload = piece
     if kind == 'text':
         u = payload
-        size = ctx.tsize(u.role, u.font, p)
+        size = opts.sizes.get(u.uid) or ctx.tsize(u.role, u.font, p)
         return _text_unit_block(ctx, u, size, width)
     if kind == 'pill':
         u = payload
-        size = ctx.tsize(u.role, u.font, _lane_p(u, p, opts))
+        size = opts.sizes.get(u.uid) or ctx.tsize(u.role, u.font, _lane_p(u, p, opts))
         b = _pill_block(ctx, u, size, opts.compact, width)
         while b is None and size > ctx.floor(u.role, u.font):
             size -= 1
@@ -1083,7 +1085,7 @@ def _make_piece(ctx, piece, p, opts, width, hmax):
     if kind == 'flow':
         blocks = []
         for u in payload:
-            size = ctx.tsize(u.role, u.font, _lane_p(u, p, opts))
+            size = opts.sizes.get(u.uid) or ctx.tsize(u.role, u.font, _lane_p(u, p, opts))
             b = _pill_block(ctx, u, size, opts.compact, width)
             if b is None:
                 return None
@@ -1441,6 +1443,358 @@ def _build_columns(ctx, cols, p, opts, floaters_inline):
     return out
 
 
+# ---------------- extreme banners: three-zone solver ----------------------
+#
+# Strips of aspect >= 4 (leaderboards, LinkedIn/Twitter-style headers) get a
+# designed three-zone composition rather than generic columns:
+#   left   the hero visual, 80-88% of the canvas height, vertically centred
+#   centre the copy stack: the headline is sized first, then subhead and fine
+#          print grow within hierarchy caps
+#   right  brand and action: logo on top, CTA below it, badges set apart
+#          below the CTA (or in a side column); tags and stamps float into
+#          free space with a generous clearance
+# Wide gutters separate the zones. Zone widths are not fixed percentages: the
+# centre takes what the copy needs so the headline is not forced into many
+# narrow lines, and the search weighs that against hero, logo and CTA sizes.
+
+BANNER_HEADLINE_TARGET = 14   # px: preferred minimum headline size on strips
+BANNER_CTA_TARGET = 11        # px: preferred minimum CTA label size on strips
+
+
+def _zone_eligible(ctx):
+    lanes = ctx.lanes
+    return (ctx.aspect >= 4.0 and len(lanes['V']) == 1
+            and lanes['V'][0].kind in ('image', 'rigid')
+            and any(u.kind == 'text' for u in lanes['C']))
+
+
+def _vstack(blocks, gaps, align='center'):
+    """Stack blocks vertically with explicit gaps; returns one Block."""
+    width = max(b.w for b in blocks)
+    items, y = [], 0.0
+    for k, b in enumerate(blocks):
+        x = 0.0 if align == 'left' else width - b.w if align == 'right' else (width - b.w) / 2
+        for i, e in b.els:
+            e2 = dict(e)
+            e2['x'] += x
+            e2['y'] += y
+            items.append((i, e2))
+        y += b.h + (gaps[k] if k < len(gaps) else 0.0)
+    return Block(width, y, items, None, max(b.font for b in blocks), 'stack')
+
+
+def _zone_copy(ctx, units, width, H, align, cache):
+    """Centre zone copy stack, sized in two passes.
+
+    1. The largest common scale p at which everything fits, using each role's
+       elasticity (headline and CTA hold their size longest, fine print gives
+       way first), so the source hierarchy is preserved.
+    2. Leftover room is shared out one pixel at a time, round-robin: headline,
+       body, fine print, badges -- each within a cap relative to the headline.
+       On tight strips the supporting copy sits at its floors after pass 1, so
+       this is where the headline reaches the largest size that still fits.
+    """
+    key = (tuple(u.uid for u in units), round(width / 2), round(H, 1))
+    if key in cache:
+        return cache[key]
+    texts = [u for u in units if u.kind in ('text', 'pill')]
+    head = next((u for u in texts if u.role == 'headline'), None)
+    pieces = _pieces_for(units)
+    sizes = {}
+    opts = Opts(compact=True, sizes=sizes)
+
+    def build():
+        return _column(ctx, pieces, 1.0, opts, width, H, align)
+
+    def at(p):
+        for u in texts:
+            sizes[u.uid] = ctx.tsize(u.role, u.font, p)
+        return build()
+
+    best = at(1.0)
+    if best is None:
+        best = at(0.0)
+        if best is None:
+            cache[key] = None
+            return None
+        lo, hi = 0.0, 1.0
+        for _ in range(12):
+            mid = (lo + hi) / 2
+            if at(mid) is not None:
+                lo = mid
+            else:
+                hi = mid
+        best = at(lo)
+    caps = {'headline': 1.0, 'body': 0.62, 'fine': 0.48, 'badge': 0.55}
+    order = sorted(texts, key=lambda u: list(caps).index(u.role) if u.role in caps else 9)
+    grow = [u for u in order if u.role in caps]
+    while grow:
+        still = []
+        for u in grow:
+            limit = int(ctx.tcap(u.role, u.font))
+            if u.role == 'headline':
+                limit = min(limit, int(0.34 * ctx.ch))
+            elif head is not None:
+                limit = min(limit, max(sizes[u.uid], int(caps[u.role] * sizes[head.uid])))
+            if sizes[u.uid] >= limit:
+                continue
+            sizes[u.uid] += 1
+            b = build()
+            if b is None:
+                sizes[u.uid] -= 1
+                continue
+            best = b
+            still.append(u)
+        grow = still
+    cache[key] = (best, dict(sizes))
+    return cache[key]
+
+
+def _hrow(blocks, sep):
+    """Blocks side by side, vertically centred; returns one Block."""
+    h = max(b.h for b in blocks)
+    items, x = [], 0.0
+    for b in blocks:
+        for i, e in b.els:
+            e2 = dict(e)
+            e2['x'] += x
+            e2['y'] += (h - b.h) / 2
+            items.append((i, e2))
+        x += b.w + sep
+    return Block(x - sep, h, items, None, max(b.font for b in blocks), 'row')
+
+
+def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size, badge_size, H,
+                tags=(), stamps=(), slot='head'):
+    """Right zone: logo on top, CTA below, badges set apart below the CTA
+    ('stack') or in a side column ('split'), fine print last.
+
+    Tags and stamps get designed slots instead of leftover space:
+    slot 'head' puts tags beside the logo and stamps in the badge group;
+    slot 'col' puts tags at the head of the badge group and stamps under the
+    CTA, which keeps the logo row narrow."""
+    top = []
+    head = []
+    for u in logos:
+        sc = min(logo_h / max(u.box[3], 1e-6), 0.3 * ctx.cw / max(u.box[2], 1e-6),
+                 H / max(u.box[3], 1e-6))
+        b = _scaled_block(ctx, u, sc)
+        if b is None:
+            return None
+        head.append(b)
+    tag_blocks = []
+    for u in tags:
+        size = max(ctx.floor(u.role, u.font), badge_size or 0, (cta_size or 0) - 2)
+        b = _pill_block(ctx, u, size, True) if u.kind == 'pill' else None
+        if b is None:
+            return None
+        tag_blocks.append(b)
+    if slot == 'head':
+        head += tag_blocks
+    if head:
+        # Brand and its sale tag share the top row, clear of the CTA below.
+        top.append(_hrow(head, max(ctx.gmin * 2, 0.6 * (cta_size or 8))) if len(head) > 1 else head[0])
+    for u in ctas:
+        b = (_pill_block(ctx, u, cta_size, True) if u.kind == 'pill'
+             else _text_unit_block(ctx, u, cta_size, None))
+        if b is None:
+            return None
+        top.append(b)
+    stamp_h = 0.22 * ctx.ch
+    if slot == 'col':
+        for u in stamps:
+            b = _scaled_block(ctx, u, stamp_h * 0.8 / max(u.box[3], 1e-6))
+            if b is None:
+                return None
+            top.append(b)
+    gaps = [max(ctx.gmin, 0.4 * (cta_size or 8))] * max(0, len(top) - 1)
+    bblocks = list(tag_blocks) if slot == 'col' else []
+    for u in badges:
+        b = _pill_block(ctx, u, badge_size, True)
+        if b is None:
+            return None
+        bblocks.append(b)
+    row_h = max((b.h for b in bblocks), default=0.18 * ctx.ch)
+    if slot == 'head':
+        for u in stamps:
+            b = _scaled_block(ctx, u, min(1.2 * row_h, stamp_h) / max(u.box[3], 1e-6))
+            if b is None:
+                return None
+            bblocks.append(b)
+    bg = max(ctx.gmin, 0.5 * (badge_size or 0))
+    if not top and not bblocks and not fine:
+        return Block(0.0, 0.0, [], None, 0.0, 'empty')
+    if mode == 'split' and bblocks and top:
+        left = _vstack(top, gaps)
+        right = _vstack(bblocks, [bg * 0.6] * (len(bblocks) - 1))
+        sep = max(ctx.gmin * 2, 0.012 * ctx.cw)
+        h = max(left.h, right.h)
+        items = []
+        for blk, x in ((left, 0.0), (right, left.w + sep)):
+            for i, e in blk.els:
+                e2 = dict(e)
+                e2['x'] += x
+                e2['y'] += (h - blk.h) / 2
+                items.append((i, e2))
+        blocks = [Block(left.w + sep + right.w, h, items, None, max(left.font, right.font), 'split')]
+        bgaps = []
+    else:
+        blocks, bgaps = list(top), list(gaps)
+        if bblocks:
+            k = per_row or len(bblocks)
+            width = max(sum(b.w for b in bblocks[i:i + k]) + bg * (len(bblocks[i:i + k]) - 1)
+                        for i in range(0, len(bblocks), k))
+            if blocks:
+                # A clear band below the CTA so badges never crowd it.
+                bgaps.append(max(ctx.gmin * 1.5, 0.7 * (cta_size or badge_size or 8)))
+            blocks.append(_flow(bblocks, width, bg))
+    if fine:
+        width = max((b.w for b in blocks), default=0.3 * ctx.cw)
+        for u in fine:
+            fb = _text_unit_block(ctx, u, ctx.floor('fine', u.font), width)
+            if fb is None:
+                return None
+            if blocks:
+                bgaps.append(max(ctx.gmin, 0.5 * fb.font))
+            blocks.append(fb)
+    blk = _vstack(blocks, bgaps)
+    return blk if blk.h <= H + 1e-6 else None
+
+
+def _zone_size_options(ctx, tight):
+    lanes = ctx.lanes
+    ctas, badges = lanes['A'], lanes['D']
+    if ctas:
+        lo = max(ctx.floor(u.role, u.font) for u in ctas)
+        hi = max(lo, int(min(ctx.tcap('cta', u.font) for u in ctas)))
+        if tight:
+            want = (lo, BANNER_CTA_TARGET - 1, BANNER_CTA_TARGET, BANNER_CTA_TARGET + 2)
+        else:
+            want = (hi, int(hi * 0.8), int(hi * 0.65))
+        cta_sizes = sorted({_clamp(v, lo, hi) for v in want})
+    else:
+        cta_sizes = [None]
+    if badges:
+        lo = max(ctx.floor('badge', u.font) for u in badges)
+        hi = max(lo, int(min(ctx.tcap('badge', u.font) for u in badges)))
+        want = (lo, lo + 1) if tight else (hi, int(hi * 0.75))
+        badge_sizes = sorted({_clamp(v, lo, hi) for v in want})
+    else:
+        badge_sizes = [None]
+    return cta_sizes, badge_sizes
+
+
+def _zone_configs(ctx, tight):
+    """Every structural option the zone solver explores."""
+    lanes = ctx.lanes
+    fine, badges, logos = lanes['F'], lanes['D'], lanes['B']
+    n_b = len(badges)
+    per_rows = sorted({n_b, max(1, (n_b + 1) // 2), 1}) if n_b > 1 else [None]
+    # The logo never shrinks below about a third of the strip: a brand mark
+    # that reads as a speck is worse than a slightly smaller headline.
+    logo_fracs = (0.48, 0.4, 0.32) if tight else (0.34, 0.26, 0.2)
+    cta_sizes, badge_sizes = _zone_size_options(ctx, tight)
+    float_modes = ('free', 'head', 'col') if lanes['X'] else ('free',)
+    layouts = []  # (badge placement, right-zone mode, badges per row)
+    for bp in (('right', 'copy') if badges else ('none',)):
+        if bp == 'right':
+            layouts += [(bp, 'stack', k) for k in per_rows]
+            if n_b > 1:
+                layouts.append((bp, 'split', None))
+        else:
+            layouts.append((bp, 'stack', None))
+    for fp, (bp, mode, k), lf, cs, bsz, fm in itertools.product(
+            ('copy', 'strip', 'right') if fine else ('none',), layouts,
+            logo_fracs if logos else (None,), cta_sizes, badge_sizes, float_modes):
+        if bp != 'right' and bsz != badge_sizes[0]:
+            continue  # badge size only matters when badges sit in the right zone
+        yield fp, bp, mode, k, lf, cs, bsz, fm
+
+
+def _zones_candidates(ctx):
+    lanes = ctx.lanes
+    hero = lanes['V'][0]
+    cw, ch = ctx.cw, ctx.ch
+    tight = ch <= 120
+    g0 = max(0.03 * cw, 2.2 * ctx.m)                 # generous gutters between zones
+    mh = ctx.mx
+    my = max(4.5, 0.05 * ch) if tight else ctx.my
+    copy_units = list(lanes['C'])
+    fine, badges, logos, ctas = lanes['F'], lanes['D'], lanes['B'], lanes['A']
+    al = [u.align for u in copy_units if u.kind == 'text']
+    align = max(set(al), key=al.count) if al else 'center'
+    tags = [u for u in lanes['X'] if u.kind == 'pill']
+    stamps = [u for u in lanes['X'] if u.kind != 'pill']
+    configs = list(_zone_configs(ctx, tight))
+    copy_cache, strip_cache = {}, {}
+    pre = []
+    for g, hf, z1 in itertools.product((g0, g0 * 0.85) if tight else (g0,),
+                                       (0.88, 0.84, 0.8) if tight else (0.88, 0.76),
+                                       (None, 0.22)):
+        # Left zone: the hero at a showcase height, vertically centred.
+        scale = min(hf * ch / max(hero.box[3], 1e-6), 0.3 * cw / max(hero.box[2], 1e-6))
+        hb = _scaled_block(ctx, hero, scale)
+        if hb is None:
+            continue
+        w1 = hb.w if z1 is None else max(hb.w, z1 * cw - mh - g)
+        if z1 is not None and w1 <= hb.w + 1:
+            continue
+        x2 = mh + w1 + g
+        for fp, bp, mode, k, lf, cs, bsz, fm in configs:
+            Hc = Hr = ch - 2 * my
+            strip = None
+            if fp == 'strip':  # fine print under the centre and right zones
+                skey = round(x2)
+                if skey not in strip_cache:
+                    sb = [_text_unit_block(ctx, u, ctx.floor('fine', u.font), cw - mh - x2) for u in fine]
+                    strip_cache[skey] = None if any(b is None for b in sb) else \
+                        _vstack(sb, [ctx.gmin] * len(sb))
+                strip = strip_cache[skey]
+                if strip is None:
+                    continue
+                Hc = Hr = Hc - strip.h - max(ctx.gmin, 0.4 * strip.font)
+            slotted = fm != 'free'
+            right = _zone_right(ctx, logos, ctas, badges if bp == 'right' else [],
+                                fine if fp == 'right' else [], mode, k, (lf or 0) * ch, cs, bsz, Hr,
+                                tags if slotted else (), stamps if slotted else (),
+                                fm if slotted else 'head')
+            if right is None:
+                continue
+            x3 = cw - mh - right.w
+            w2 = (x3 - g - x2) if right.els else (cw - mh - x2)
+            if w2 < 0.25 * cw:
+                continue
+            cu = copy_units + (badges if bp == 'copy' else []) + (fine if fp == 'copy' else [])
+            res = _zone_copy(ctx, cu, min(w2, 0.55 * cw), Hc, align, copy_cache)
+            if res is None:
+                continue
+            out = {}
+            _shift(hb, mh + (w1 - hb.w) / 2, (ch - hb.h) / 2, out)
+            _shift(res[0], x2 + (w2 - res[0].w) / 2, my + (Hc - res[0].h) / 2, out)
+            if right.els:
+                _shift(right, x3, my + (Hr - right.h) / 2, out)
+            if strip is not None:
+                _shift(strip, x2, ch - my - strip.h, out)
+            kind = 'zones' if fp in ('copy', 'none') else f'zones:fine_{fp}'
+            label = (f'zones hero={hf} gutter={g:.0f} z1={z1} fine={fp} badges={bp}/{mode}/k={k} '
+                     f'logo={lf} cta={cs} badge={bsz} floaters={fm}')
+            pre.append((_score(ctx, out, kind), label, out, slotted, kind, (x3 - 0.25 * g, 0.0, cw, ch)))
+    # Floaters and full validation only for the most promising layouts.
+    pre.sort(key=lambda t: -t[0])
+    clearance = max(ctx.gmin, 0.35 * g0)
+    results = []
+    for _, label, out, slotted, kind, region in pre:
+        # Slotted tags/stamps already sit in the right zone; otherwise they
+        # float, but only inside the brand/action zone, clear of the gutters.
+        done = out if slotted else _place_floaters(ctx, dict(out), 1.0, Opts(compact=True),
+                                                   clearance, region)
+        if done is not None:
+            results.append((kind, done, Opts(compact=True), label))
+            if len(results) >= 16:
+                break
+    return results
+
+
 # ---------------- anchored: keep source positions -------------------------
 
 def _build_anchored(ctx):
@@ -1687,13 +2041,13 @@ def _unit_boxes(ctx, out, units):
     return res
 
 
-def _place_floaters(ctx, out, p, opts):
+def _place_floaters(ctx, out, p, opts, clearance=None, region=None):
     floaters = sorted(ctx.lanes['X'], key=lambda u: -IMPORTANCE.get(u.role, 0.5))
     if not floaters:
         return out
     placed_units = [u for u in ctx.an.units if all(i in out for i in u.ids)]
     obstacles = _unit_boxes(ctx, out, placed_units)
-    g = max(ctx.gmin, 0.5 * ctx.gap)
+    g = clearance if clearance is not None else max(ctx.gmin, 0.5 * ctx.gap)
     cw, ch = ctx.cw, ctx.ch
     for u in floaters:
         ax = (u.box[0] + u.box[2] / 2) / ctx.sw * cw
@@ -1716,8 +2070,9 @@ def _place_floaters(ctx, out, p, opts):
                 ys.update((ob[1] - g - b.h, ob[1] + ob[3] + g, ob[1], ob[1] + ob[3] - b.h))
             best = None
             edge = min(ctx.mx, ctx.my) * 0.5
-            xs = [x for x in xs if edge - 1e-6 <= x and x + b.w <= cw - edge + 1e-6]
-            ys = [y for y in ys if edge - 1e-6 <= y and y + b.h <= ch - edge + 1e-6]
+            rx0, ry0, rx1, ry1 = region or (0.0, 0.0, cw, ch)
+            xs = [x for x in xs if max(edge, rx0) - 1e-6 <= x and x + b.w <= min(cw - edge, rx1) + 1e-6]
+            ys = [y for y in ys if max(edge, ry0) - 1e-6 <= y and y + b.h <= min(ch - edge, ry1) + 1e-6]
             # Nearest-to-anchor first (lazy best-first over the x/y grid): the
             # first collision-free spot wins.
             if xs and ys:
@@ -1947,6 +2302,8 @@ def _score(ctx, out, layout_kind):
     s = 0.0
     hier = []
     for u in an.units:
+        if not all(i in out for i in u.ids):
+            continue  # a floater not placed yet (zone pre-scoring)
         imp = IMPORTANCE.get(u.role, 1.0)
         if u.kind in ('text', 'pill'):
             e = out[u.text_id]
@@ -1983,8 +2340,10 @@ def _score(ctx, out, layout_kind):
         for b in hier:
             if a[0] >= 1.3 * b[0] and a[1] < 1.1 * b[1]:
                 s -= 0.8 * (1.1 * b[1] - a[1]) / max(b[1], 1.0)
+    if ctx.aspect >= 4.0:
+        s += _banner_terms(ctx, out)
     # Coverage and balance of the foreground content.
-    boxes = [_el_box(out[i]) for u in an.units for i in u.ids]
+    boxes = [_el_box(out[i]) for u in an.units for i in u.ids if i in out]
     if boxes:
         x, y, w, h = _union(boxes)
         cov_w = w / (cw - 2 * ctx.mx)
@@ -2003,6 +2362,56 @@ def _score(ctx, out, layout_kind):
         s -= 0.15   # floaters folded into a column drift from the source composition
     if 'logo_late' in layout_kind:
         s -= 0.35   # brand reads first: logo left of / above the copy
+    if layout_kind.startswith('zones'):
+        s += 2.0    # on strips, the designed three-zone composition is preferred
+        # Fine print belongs under the subhead; elsewhere it is a compromise.
+        s -= {'zones:fine_strip': 0.3, 'zones:fine_right': 0.8}.get(layout_kind, 0.0)
+    return s
+
+
+def _banner_terms(ctx, out):
+    """Strip priorities: a readable headline that does not wrap into many
+    lines, a prominent CTA and a showcase-sized hero."""
+    s = 0.0
+    tight = ctx.ch <= 120
+    for u in ctx.an.units:
+        if not all(i in out for i in u.ids):
+            continue
+        if u.role == 'headline' and u.kind == 'text':
+            e = out[u.text_id]
+            f = float(e['font_size'])
+            target = min(BANNER_HEADLINE_TARGET, ctx.tcap('headline', u.font))
+            if f < target:
+                s -= 0.9 * (target - f)
+            lines = measure(e, e['width'], e['font_size']).lines
+            if lines > 3:
+                s -= 1.0 * (lines - 3)
+        elif u.role == 'cta' and u.kind == 'pill':
+            f = float(out[u.text_id]['font_size'])
+            target = min(BANNER_CTA_TARGET, ctx.tcap('cta', u.font))
+            if f < target:
+                s -= 0.4 * (target - f)
+        elif u.role == 'hero' and tight:
+            frac = _union(_el_box(out[i]) for i in u.ids)[3] / ctx.ch
+            if frac < 0.8:
+                s -= 4.0 * (0.8 - frac) / 0.8
+        elif u.role == 'logo' and tight:
+            # The brand mark must read: visible logo height ~30% of the strip.
+            box = _union(_el_box(out[i]) for i in u.ids)
+            visible = box[3] * (u.visible[3] - u.visible[1])
+            s -= 0.15 * max(0.0, 0.3 * ctx.ch - visible)
+    # Nothing floats right beside the CTA: side-by-side neighbours crowd it.
+    ctas = [_union(_el_box(out[i]) for i in u.ids) for u in ctx.an.units
+            if u.role == 'cta' and all(i in out for i in u.ids)]
+    for u in ctx.lanes['X']:
+        if not all(i in out for i in u.ids):
+            continue
+        b = _union(_el_box(out[i]) for i in u.ids)
+        for c in ctas:
+            side_by_side = min(b[1] + b[3], c[1] + c[3]) - max(b[1], c[1]) > 0.3 * min(b[3], c[3])
+            gap = max(b[0] - (c[0] + c[2]), c[0] - (b[0] + b[2]))
+            if side_by_side and gap < 1.2 * c[3]:
+                s -= 0.6
     return s
 
 
@@ -2154,6 +2563,10 @@ def _candidates(ctx):
                     lay = _search(lambda p: _build_stack(ctx, rows, p, opts, rhythm))
                     if lay is not None:
                         results.append((name, lay, opts, f'{name} compact={compact} r={r}'))
+    # ---- extreme banners: three-zone composition
+    if _zone_eligible(ctx):
+        results += _zones_candidates(ctx)
+
     # ---- horizontal lane columns
     if wide:
         compact_set = (True,) if ch < 320 else (False, True)

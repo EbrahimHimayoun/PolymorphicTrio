@@ -8,7 +8,7 @@ the command, what it proves and the result we recorded.
 
 | File | Change |
 |---|---|
-| `engine/resize.py` | Full rewrite: renderer-exact typesetting, geometry-based role detection, lane/column reflow for wide canvases, rhythm-preserving stacks for tall ones, anchored layout for same-ratio resizes, validated candidate search. |
+| `engine/resize.py` | Full rewrite: renderer-exact typesetting, geometry-based role detection, three-zone solver for strips of aspect >= 4, lane/column reflow for other wide canvases, rhythm-preserving stacks for tall ones, anchored layout for same-ratio resizes, validated candidate search. |
 | `Dockerfile` | Pinned stack, offline env vars, build-time smoke test, dropped unused `libglib2.0-0`. |
 | `requirements.txt` | Every package pinned; `cr-renderer` pinned to commit `a17e1fb`. |
 | `tools/` (dev only, not in the image) | `validate.py` strict checker and format sweep, `synthetic.py` adversarial designs, `contact_sheet.py`, `debug_candidates.py`. |
@@ -65,7 +65,7 @@ Expected output (timings vary; first task includes font loading):
 ```
 [chameleon_sample_level1_warmup.json] OK in 0.6s -> ..._output.json, ..._output.png
 [chameleon_sample_level2_core.json] OK in 0.1s -> ..._output.json, ..._output.png
-[chameleon_sample_level3_advanced.json] OK in 0.5s -> ..._output.json, ..._output.png
+[chameleon_sample_level3_advanced.json] OK in 1.6s -> ..._output.json, ..._output.png
 ```
 
 Then open `output/*.png`. They must show real fonts and brand assets; labelled
@@ -150,8 +150,8 @@ the engine's own quality bar:
 
 | Sweep | Result |
 |---|---|
-| 3 samples x (own target + 18 formats: IG post/portrait/story, YouTube, Facebook/Twitter/LinkedIn headers, leaderboard, mobile banners, medium rectangle, skyscrapers, billboard, Pinterest, 16:9, A4, 4:1) | **57/57 pass**, slowest 0.7s |
-| 5 adversarial synthetic designs (`python -m tools.synthetic DIR`) x 19 targets | **94/95 pass**, slowest 3.7s (a 37-element design) |
+| 3 samples x (own target + 18 formats: IG post/portrait/story, YouTube, Facebook/Twitter/LinkedIn headers, leaderboard, mobile banners, medium rectangle, skyscrapers, billboard, Pinterest, 16:9, A4, 4:1) | **57/57 pass**, slowest 1.8s |
+| 5 adversarial synthetic designs (`python -m tools.synthetic DIR`) x 19 targets | **94/95 pass**, slowest 3.2s (a 37-element design) |
 | Same input twice | Identical output (deterministic) |
 | Caller's `source` dict after `resize()` | Unmodified |
 | skia unavailable (import blocked) | Falls back to Pillow metrics; valid output, no crash |
@@ -163,26 +163,64 @@ rhythm (logo near the top, headline and CTA where the source placed them),
 type scaled 1.25x (headline 75px, CTA 37px). Check: nothing cramped, spacing
 proportionate, logo centred.
 
-**Level 2, 1080x1080 to 1600x400.** Lane columns: brand and headline on the
-left, CTA centre-right, product on the right, "NEW FLAVOR" badge floating near
-its original top position, style-run colouring intact (headline 82px on one
-line, subhead 35px, CTA 32px). The corner-bleeding decorative circle is kept
-on-canvas, so main.py reports no off-canvas warning.
+**Level 2, 1080x1080 to 1600x400.** Three-zone strip layout: product at 88%
+of the height on the left; headline (82px, one line, style-run colouring
+intact) over the 35px subhead in the centre; logo, CTA (32px) and the "NEW
+FLAVOR" badge (30px) stacked on the right. The corner-bleeding decorative
+circle is kept on-canvas, so main.py reports no off-canvas warning.
 
-**Level 3, 1080x1350 to 728x90.** All 17 elements kept, no overlaps, nothing
-off-canvas:
+**Level 3, 1080x1350 to 728x90.** Three-zone strip layout (see below). All
+17 elements kept, no overlaps, nothing off-canvas:
 
-| Role (inferred, never from ids) | Elements | Placement | Font |
+| Role (inferred, never from ids) | Elements | Zone and placement | Font |
 |---|---|---|---|
-| hero | product | full-height left column, 78x78 | |
-| headline | headline | copy column, 3 lines | 11px |
-| body | subhead | under headline, 2 lines | 7px |
-| fine | legal_text | bottom of copy column, 1 line | 6px |
-| logo | logo | right column top, 120x37 | |
-| cta | cta_bg + cta_label | right column, compact pill | 9px |
-| badge x3 | badge1-3 | one row under the CTA | 7px |
-| tag | ribbon (rotated -12 deg) | top-right corner, rotation kept | 7px |
-| stamp | holiday_watermark (missing asset) | free space beside the CTA; renderer draws its placeholder | |
+| hero | product | left zone, 72x72 box (80% of height), vertically centred | |
+| headline | headline | centre zone (14%-61%), 3 lines | 12px |
+| body | subhead | under the headline, 2 lines | 7px |
+| fine | legal_text | under the subhead, 1 line | 6px |
+| logo | logo | right zone, top of the brand column, 115x36 | |
+| cta | cta_bg + cta_label | right zone, under the logo | 10px |
+| stamp | holiday_watermark (missing asset) | right zone, its own slot under the CTA; renderer draws its placeholder | |
+| tag | ribbon (rotated -12 deg) | right zone, heading the badge column, rotation kept | 8px |
+| badge x3 | badge1-3 | right zone, badge column beside the brand column | 7px |
+
+### Extreme strips (aspect >= 4): the three-zone solver
+
+Leaderboards and 4:1 headers get a dedicated solver instead of generic
+columns: **left** the hero at 80-88% of the strip height, vertically centred;
+**centre** the copy stack; **right** brand and action (logo, CTA under it,
+badges set apart). Gutters are 3% of the width (or 2.55%, if that buys
+readable type). The solver searches hero height, legal placement (under the subhead,
+as a strip, or in the right zone), badge placement (right-zone stack or side
+column, or under the copy), logo height (never below ~1/3 of the strip), CTA
+and badge sizes, and designed slots for tags/stamps (beside the logo, or
+heading the badge column with the stamp under the CTA). Floaters that are not
+slotted may only use free space inside the right zone. Copy is sized in two
+passes: the largest common scale that fits with role elasticity, then leftover
+room shared round-robin (headline, body, fine print, badges) within hierarchy
+caps. Scoring adds strip priorities: headline >= 14px preferred and <= 3
+lines, CTA >= 11px preferred, hero >= 80% of the height on strips <= 120px,
+visible logo >= 30% of the height, a penalty for anything floated directly
+beside the CTA, and a penalty when fine print leaves the copy column.
+
+Measured limits of the Level 3 content at 728x90:
+
+- The product PNG has ~31% transparent padding baked in, so an 80-88% box shows
+  the bottle at ~55-61% of the height. A larger box would leave the canvas or
+  need cropping or distortion.
+- At 14px the 142-character headline needs a centre column of at least 380px
+  for 3 lines (16px: 420px); a 22%-65% centre zone is 313px, which forces 4
+  lines. Headline (14px, 52px tall) + subhead (18px) + legal (8px) is 78px of
+  a 90px strip before any spacing, so 14px only fits with ~2px gaps. The
+  solver lands on 12px with proportional spacing; the centre zone spans 14%-61%.
+
+Before vs after the zone solver (same JSON checks): headline 11px to 12px, CTA
+9px to 10px, hero 87% to 80% of the height (within the 80-88% band; 88% costs
+the CTA 1px), gutter 15px to 18px. The stamp moves from beside the CTA to its
+own slot below it, and the ribbon from a free-floating corner position to the
+head of the badge column. At 1600x400 and 1584x396, the zone layout gives the
+product 76-88% of the height, a 39-40px headline over a 23px subhead, and a
+large logo above the CTA.
 
 At its own 1080x1350 size, Level 3 reproduces the source layout (anchored
 candidate) except for two minimal fixes: the ribbon moves 0.6px back on-canvas
