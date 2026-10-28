@@ -72,6 +72,9 @@ IMPORTANCE = {'divider': 0.2, 'headline': 3.0, 'cta': 2.2, 'hero': 1.8, 'logo': 
               'tag': 0.7, 'shape': 0.4, 'stamp': 0.35, 'fine': 0.5,
               'label': 1.0}
 
+# Extra breathing room for the official opaque missing-image diagnostic box.
+MISSING_ASSET_GAP_FRACTION = 0.12  # capped at 12 target pixels
+
 _BOLD_WEIGHTS = {'bold', 'semibold', 'extrabold', 'black'}
 _FONT_WEIGHTS = {'thin', 'light', 'extralight', 'regular', 'medium',
                  'semibold', 'bold', 'extrabold', 'black'}
@@ -1601,13 +1604,22 @@ def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size,
             return None
         top.append(b)
     stamp_h = 0.22 * ctx.ch
+    missing_gaps = []
     if slot == 'col':
         for u in stamps:
             b = _scaled_block(ctx, u, stamp_h * 0.8 / max(u.box[3], 1e-6))
             if b is None:
                 return None
+            if u.missing and top:
+                missing_gaps.append(len(top) - 1)
             top.append(b)
     gaps = [max(ctx.gmin, 0.4 * (cta_size or 8))] * max(0, len(top) - 1)
+    # Unresolved assets render as opaque diagnostic boxes, not transparent
+    # artwork. Give them their own visual breathing room; if the stack no
+    # longer fits, candidate selection can choose another logo size/layout.
+    # The rule adjusts gaps, not text measurements or asset proportions.
+    for index in missing_gaps:
+        gaps[index] = max(gaps[index], min(12.0, MISSING_ASSET_GAP_FRACTION * ctx.short), 0.8 * (cta_size or 8))
     bblocks = list(tag_blocks) if slot == 'col' else []
     for u in badges:
         b = _pill_block(ctx, u, badge_size, True)
@@ -2049,7 +2061,9 @@ def _place_floaters(ctx, out, p, opts, clearance=None, region=None):
     obstacles = _unit_boxes(ctx, out, placed_units)
     g = clearance if clearance is not None else max(ctx.gmin, 0.5 * ctx.gap)
     cw, ch = ctx.cw, ctx.ch
+    base_gap = g
     for u in floaters:
+        g = max(base_gap, min(12.0, MISSING_ASSET_GAP_FRACTION * ctx.short)) if u.missing else base_gap
         ax = (u.box[0] + u.box[2] / 2) / ctx.sw * cw
         ay = (u.box[1] + u.box[3] / 2) / ctx.sh * ch
         done = False
@@ -2411,7 +2425,25 @@ def _banner_terms(ctx, out):
             side_by_side = min(b[1] + b[3], c[1] + c[3]) - max(b[1], c[1]) > 0.3 * min(b[3], c[3])
             gap = max(b[0] - (c[0] + c[2]), c[0] - (b[0] + b[2]))
             if side_by_side and gap < 1.2 * c[3]:
-                s -= 0.6
+                s -= 3.0 if u.missing else 0.6
+    # Missing images show an opaque, high-contrast placeholder. Prefer a
+    # clear gap from ALL content (including brand marks and fine print), not
+    # just a collision-free slot next to the CTA. Keep this a soft preference
+    # so dense formats do not sacrifice readable copy to a diagnostic box.
+    for u in ctx.an.units:
+        if not u.missing or not all(i in out for i in u.ids):
+            continue
+        box = _union(_el_box(out[i]) for i in u.ids)
+        distances = []
+        for other in ctx.an.units:
+            if other is u or not all(i in out for i in other.ids):
+                continue
+            ob = _union(_el_box(out[i]) for i in other.ids)
+            dx = max(0, box[0] - ob[0] - ob[2], ob[0] - box[0] - box[2])
+            dy = max(0, box[1] - ob[1] - ob[3], ob[1] - box[1] - box[3])
+            distances.append(math.hypot(dx, dy))
+        if distances:
+            s -= 0.5 * max(0, min(12.0, MISSING_ASSET_GAP_FRACTION * ctx.short) - min(distances))
     return s
 
 

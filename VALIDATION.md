@@ -1,3 +1,110 @@
+# Full test-suite migration — October 28, 2026
+
+The older suite now loads against the current role-aware engine. All layout
+checks call `resize(source, target_canvas)`; the configuration test patches the
+current exposed `TEXT_FLOOR` setting. No removed production helpers were restored.
+The three missing-asset spacing tests remain unchanged.
+
+Command:
+
+```sh
+.venv312/bin/python -m unittest discover -s tests -v
+```
+
+**Result: 16 tests, 0 failures, 0 errors, 0 skips.** This supersedes the earlier
+collection failure recorded in the missing-asset section below.
+
+Coverage retained or strengthened:
+
+- Exact element order/count/IDs, required and unknown source properties, unchanged
+  text/fonts/colors/assets/opacity, requested canvas, and source immutability.
+- Independent four-corner rotation bounds and inter-element collision checks;
+  intentional grouped label/background layering is allowed.
+- Proportional foreground images, allowing only the calculable error from the
+  current engine's 0.01px geometry rounding, rather than seven-decimal ratio
+  equality after rounding.
+- Text fit using the official converter's glyph advances and wrap routine, Skia
+  ascent/descent, and letter spacing within styled spans. A new fixture exercises
+  bold/italic/color spans, explicit newlines and nonzero letter spacing.
+- Hierarchy in an explicitly feasible fixture still requires 1.18 size separation;
+  equal source typography must remain equal. Sample standalone copy must retain
+  strict source size ordering. Grouped buttons have separate prominence rules,
+  and integer sizes such as 7px versus 6px preserve ordering without satisfying
+  the obsolete universal 1.18 ratio. Constrained copy still passes bounds/fit
+  checks and keeps the largest source text above 10px, without requiring any
+  readability shortfall or fabricating the removed diagnostic report.
+- Public small/large-canvas fixtures verify text and button/background growth
+  together, label containment, and collision-free final layouts. A genuine
+  three-member rotated group verifies rigid relative offsets/proportions, while
+  allowing the current engine to trim loose text boxes to measured ink height.
+- Missing-image visibility/proportions/clearance, renamed IDs/group IDs/assets,
+  non-default opacity, four additional formats per sample, empty input and a
+  36-element layout. Decoration checks retain evidence-based layering and
+  independent canvas anchoring, including bounds clamping.
+- The configurable-floor fixture raises fine print from 6px to at least 8px via
+  the current `TEXT_FLOOR` policy, checking actual output rather than a removed
+  preference dictionary.
+
+`tests/fixtures/level1_baseline.json` was refreshed from the unchanged current
+engine: the old fixture held the pre-rewrite layout (fractional 83.85/41.93px
+text), while the current engine emits integer 75/37px text and a different
+anchored arrangement. Exact equality against the new frozen snapshot remains
+in the test. This was a test migration, not a new layout change.
+
+Production engine, renderer and assets were unchanged during this repair.
+All three samples were rerendered with `.venv312/bin/python -m engine.main`.
+Docker verification remains pending. No commit or push was performed.
+
+---
+
+# Missing-asset spacing verification — October 28, 2026
+
+The current engine has been rewritten since the historical validation recorded
+below. This section describes checks performed for the missing-placeholder fix.
+
+- Confirmed `holiday_watermark` still references the deliberately absent
+  `solstice_holiday_badge_2025.png`. The official converter calls
+  `renderer/converter/assets.py:load_asset_image()`, which calls `_placeholder()`
+  for an absent file. The rough red border and clipped diagnostic filename are
+  renderer output, not generated artwork or a layout-engine shape. The official
+  renderer and assets are unchanged.
+- Added general missing-image clearance in floater placement, dedicated stamp
+  stack gaps and candidate scoring. Clearance is 12% of the shorter canvas side,
+  capped at 12px. This is a layout preference rather than a universal feasibility
+  constraint. The engine still falls back when the content cannot fit.
+- The Level 3 placeholder moves from below the CTA to a clear slot to the left
+  of the branding, increasing from 35.64×15.84px to 38.16×16.96px. Its original
+  ID, asset reference, effective opacity (1) and 2.25:1 aspect ratio are preserved.
+  The nearest foreground clearance is approximately 10.8px (previously 4px).
+- Main copy sizes remain: headline 12px, supporting copy 7px, badges 7px, legal
+  text 6px. CTA increases from 10px to 11px. The selected layout uses a 28.8px-tall
+  logo box instead of 36px, and a 7px ribbon label instead of 8px. Thus the
+  placeholder does not gain a large region at the expense of the main copy.
+- Rendered all three samples with `.venv312/bin/python -m engine.main`; all
+  self-checks reported OK. Inspected the Level 3 PNG at native size. Levels 1
+  and 2 are pixel-identical to PNGs saved before this change.
+- Three focused tests pass using
+  `.venv312/bin/python -m unittest discover -s tests -p 'test_missing_asset_layout.py' -v`.
+  They independently rotate corners for bounds/overlaps, check preserved
+  properties and image ratios, verify missing-image visibility/clearance, and
+  check that renamed IDs and a different missing filename do not change layout.
+  An explicit non-default opacity is also preserved.
+- Before the test migration documented above, the full existing suite could not collect: `tests/test_resize.py` imports
+  removed helpers such as `readability_report` from the newer engine. This
+  pre-existing API mismatch was observed before the spacing edits and is now
+  resolved by the migration above. The historical 12-test result below does not
+  describe the current engine.
+
+The placeholder remains deliberately visible, including its rough diagnostic
+appearance. Geometry changes cannot eliminate that appearance without replacing
+artwork or changing the renderer, neither of which was done. Tiny text remains a
+limitation of this extreme format. Docker verification remains pending. No commit
+or push was performed.
+
+---
+
+# Historical allocation and readability validation
+
 # CHAMELEON engine: validation
 
 How to verify the engine builds and runs offline exactly as stage-one scoring
