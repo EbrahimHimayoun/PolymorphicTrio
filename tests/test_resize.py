@@ -257,7 +257,48 @@ class ResizeTests(unittest.TestCase):
         self.assert_valid(task['source'],output)
         largest=max(task['source']['elements'],key=lambda e:e.get('font_size',0))
         resized=next(e for e in output['elements'] if e['id']==largest['id'])
-        self.assertGreater(resized['font_size'],10)
+        self.assertGreaterEqual(resized['font_size'],13)
+        # The selected layout must improve supporting copy too, rather than
+        # buying a larger headline by making the already-small body smaller.
+        from engine import resize as engine
+        by_id={e['id']:e for e in output['elements']}
+        for u in engine.analyse(task['source']).units:
+            if u.role=='body':
+                identifier=task['source']['elements'][u.text_id]['id']
+                self.assertGreaterEqual(by_id[identifier]['font_size'],9)
+        # Public resize(), without debug hooks or a manual candidate override,
+        # must reproduce the approved copy geometry and enlarged right hero.
+        approved=json.loads((ROOT/'tests/fixtures/level3_approved_geometry.json').read_text())
+        for identifier,fields in approved.items():
+            for key,value in fields.items():
+                if key=='font_size':
+                    self.assertEqual(by_id[identifier][key],value)
+                else:
+                    self.assertAlmostEqual(by_id[identifier][key],value,delta=.03,
+                                           msg=f'{identifier}.{key}')
+
+    def test_banner_copy_can_use_parallel_columns(self):
+        from engine import resize as engine
+        task=next(task for path,task in fixtures() if 'level3' in path.name)
+        analysis=engine.analyse(task['source'])
+        ctx=engine.Ctx(task['source'],task['target_canvas'],analysis)
+        units=[u for u in analysis.units if u.role in ('headline','body','fine')]
+        result=engine._zone_copy(ctx,units,500,80,'center',{},split=0.55)
+        self.assertIsNotNone(result)
+        block,_=result
+        out=dict(block.els)
+        self.assertEqual(set(out),{i for u in units for i in u.ids})
+        head=next(out[u.text_id] for u in units if u.role=='headline')
+        body=next(out[u.text_id] for u in units if u.role=='body')
+        fine=next(out[u.text_id] for u in units if u.role=='fine')
+        self.assertLessEqual(head['x']+head['width'],body['x'])
+        self.assertGreaterEqual(fine['y'],max(head['y']+head['height'],body['y']+body['height']))
+        self.assertLessEqual(block.w,500)
+        self.assertLessEqual(block.h,80)
+        for e in out.values():
+            w,h,_=renderer_measure(e)
+            self.assertLessEqual(w,e['width']+1e-5)
+            self.assertLessEqual(h,e['height']+1e-5)
 
     def test_missing_asset_gets_real_collision_free_space(self):
         source={'canvas':{'width':400,'height':200},'elements':[
@@ -271,6 +312,30 @@ class ResizeTests(unittest.TestCase):
         self.assertGreaterEqual(result[1]['width'],100)
         self.assertGreaterEqual(result[1]['height'],50)
         self.assert_valid(source,output)
+
+    def test_hero_growth_can_move_up_without_moving_copy(self):
+        from engine import resize as engine
+        source={'canvas':{'width':400,'height':200},'elements':[
+            dict(id='picture',type='image',asset_id='solstice_bottle.png',
+                 x=140,y=10,width=60,height=60,fit='contain'),
+            text('left',0,0,130,200,12,'Left copy'),
+            text('right',190,80,200,110,12,'Right copy')]}
+        analysis=engine.analyse(source)
+        ctx=engine.Ctx(source,source['canvas'],analysis)
+        original=dict(enumerate(deepcopy(source['elements'])))
+        original[0].update(y=90,width=40,height=40)
+        saved=deepcopy(original)
+        out=engine._grow_hero_in_free_space(ctx,original)
+        self.assertEqual(original,saved)
+        self.assertEqual(out[1],original[1])
+        self.assertEqual(out[2],original[2])
+        self.assertGreater(out[0]['width'],original[0]['width']+10)
+        self.assertLess(out[0]['y'],original[0]['y'])
+        self.assertEqual(out[0]['asset_id'],original[0]['asset_id'])
+        self.assertAlmostEqual(out[0]['width']/out[0]['height'],1)
+        self.assert_valid(source,{'canvas':source['canvas'],'elements':list(out.values())})
+        # Once the local free space is filled, a repeat pass must be stable.
+        self.assertEqual(engine._grow_hero_in_free_space(ctx,out),out)
 
     def test_rotated_complex_group_remains_rigid(self):
         source={'canvas':{'width':300,'height':300},'elements':[

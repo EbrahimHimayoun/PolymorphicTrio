@@ -1462,6 +1462,7 @@ def _build_columns(ctx, cols, p, opts, floaters_inline):
 
 BANNER_HEADLINE_TARGET = 14   # px: preferred minimum headline size on strips
 BANNER_CTA_TARGET = 11        # px: preferred minimum CTA label size on strips
+BANNER_COPY_FIRST_BONUS = 0.1  # small composition preference, below font-size penalties
 
 
 def _zone_eligible(ctx):
@@ -1486,7 +1487,7 @@ def _vstack(blocks, gaps, align='center'):
     return Block(width, y, items, None, max(b.font for b in blocks), 'stack')
 
 
-def _zone_copy(ctx, units, width, H, align, cache):
+def _zone_copy(ctx, units, width, H, align, cache, split=None):
     """Centre zone copy stack, sized in two passes.
 
     1. The largest common scale p at which everything fits, using each role's
@@ -1497,7 +1498,7 @@ def _zone_copy(ctx, units, width, H, align, cache):
        On tight strips the supporting copy sits at its floors after pass 1, so
        this is where the headline reaches the largest size that still fits.
     """
-    key = (tuple(u.uid for u in units), round(width / 2), round(H, 1))
+    key = (tuple(u.uid for u in units), width, H, align, split)
     if key in cache:
         return cache[key]
     texts = [u for u in units if u.kind in ('text', 'pill')]
@@ -1507,7 +1508,31 @@ def _zone_copy(ctx, units, width, H, align, cache):
     opts = Opts(compact=True, sizes=sizes)
 
     def build():
-        return _column(ctx, pieces, 1.0, opts, width, H, align)
+        if split is None:
+            return _column(ctx, pieces, 1.0, opts, width, H, align)
+        # Give headline and supporting copy their own vertical space. Fine
+        # print spans both columns below them, retaining every original unit.
+        if head is None:
+            return None
+        supporting = [u for u in units if u is not head and u.role != 'fine']
+        if not supporting:
+            return None
+        fine = [u for u in units if u.role == 'fine']
+        footer = _column(ctx, _pieces_for(fine), 1.0, opts, width, H, align) if fine else None
+        if fine and footer is None:
+            return None
+        gap = max(ctx.gmin, 0.06 * H)
+        room = H - footer.h - gap if footer else H
+        if room <= 0 or width <= gap:
+            return None
+        left_w = (width - gap) * split
+        left = _column(ctx, _pieces_for([head]), 1.0, opts, left_w, room, align)
+        right = _column(ctx, _pieces_for(supporting), 1.0, opts,
+                        width - gap - left_w, room, align)
+        if left is None or right is None:
+            return None
+        row = _hrow([left, right], gap)
+        return _vstack([row, footer], [gap], align) if footer else row
 
     def at(p):
         for u in texts:
@@ -1529,6 +1554,11 @@ def _zone_copy(ctx, units, width, H, align, cache):
                 hi = mid
         best = at(lo)
     caps = {'headline': 1.0, 'body': 0.62, 'fine': 0.48, 'badge': 0.55}
+    if ctx.aspect >= 4.0 and ctx.ch <= 120:
+        # Compress the typographic hierarchy on short banners: supporting
+        # copy can use its available space independently of headline growth.
+        # The headline remains larger; renderer measurements still gate fit.
+        caps['body'] = 0.85
     order = sorted(texts, key=lambda u: list(caps).index(u.role) if u.role in caps else 9)
     grow = [u for u in order if u.role in caps]
     while grow:
@@ -1740,8 +1770,11 @@ def _zones_candidates(ctx):
     configs = list(_zone_configs(ctx, tight))
     copy_cache, strip_cache = {}, {}
     pre = []
-    for g, hf, z1 in itertools.product((g0, g0 * 0.85) if tight else (g0,),
-                                       (0.88, 0.84, 0.8) if tight else (0.88, 0.76),
+    # Keep the original showcase layouts, but also let measured copy compete
+    # for space with more compact visuals and gutters on short banners.
+    # Scoring still decides whether the extra text width is worth the tradeoff.
+    for g, hf, z1 in itertools.product((g0, g0 * 0.85, max(ctx.gmin, g0 * 0.4)) if tight else (g0,),
+                                       (0.88, 0.84, 0.8, 0.65, 0.5) if tight else (0.88, 0.76),
                                        (None, 0.22)):
         # Left zone: the hero at a showcase height, vertically centred.
         scale = min(hf * ch / max(hero.box[3], 1e-6), 0.3 * cw / max(hero.box[2], 1e-6))
@@ -1752,7 +1785,11 @@ def _zones_candidates(ctx):
         if z1 is not None and w1 <= hb.w + 1:
             continue
         x2 = mh + w1 + g
-        for fp, bp, mode, k, lf, cs, bsz, fm in configs:
+        # Small width changes can remove a whole wrapped line, freeing height
+        # for the independently sized body copy without reducing the headline.
+        copy_splits = (None,) + tuple(0.45 + 0.025 * i for i in range(9)) if tight else (None,)
+        for config, copy_split in itertools.product(configs, copy_splits):
+            fp, bp, mode, k, lf, cs, bsz, fm = config
             Hc = Hr = ch - 2 * my
             strip = None
             if fp == 'strip':  # fine print under the centre and right zones
@@ -1777,7 +1814,7 @@ def _zones_candidates(ctx):
             if w2 < 0.25 * cw:
                 continue
             cu = copy_units + (badges if bp == 'copy' else []) + (fine if fp == 'copy' else [])
-            res = _zone_copy(ctx, cu, min(w2, 0.55 * cw), Hc, align, copy_cache)
+            res = _zone_copy(ctx, cu, w2, Hc, align, copy_cache, split=copy_split)
             if res is None:
                 continue
             out = {}
@@ -1789,20 +1826,40 @@ def _zones_candidates(ctx):
                 _shift(strip, x2, ch - my - strip.h, out)
             kind = 'zones' if fp in ('copy', 'none') else f'zones:fine_{fp}'
             label = (f'zones hero={hf} gutter={g:.0f} z1={z1} fine={fp} badges={bp}/{mode}/k={k} '
-                     f'logo={lf} cta={cs} badge={bsz} floaters={fm}')
+                     f'logo={lf} cta={cs} badge={bsz} floaters={fm} copy_split={copy_split}')
             pre.append((_score(ctx, out, kind), label, out, slotted, kind, (x3 - 0.25 * g, 0.0, cw, ch)))
+            if tight and strip is None:
+                # Also read copy first, then the product beside brand/action.
+                # Reuse the measured copy blocks so this arrangement never
+                # buys product placement by shrinking the text. A spanning
+                # fine-print strip needs a different packing and is excluded.
+                moved = {i: dict(e) for i, e in out.items()}
+                for i, _ in res[0].els:
+                    moved[i]['x'] -= w1 + g
+                for i, _ in hb.els:
+                    moved[i]['x'] += x3 - g - w1 - mh
+                right_label = label + ' hero_side=right'
+                pre.append((_score(ctx, moved, kind), right_label, moved, slotted,
+                            kind, (x3 - 0.25 * g, 0.0, cw, ch)))
     # Floaters and full validation only for the most promising layouts.
     pre.sort(key=lambda t: -t[0])
     clearance = max(ctx.gmin, 0.35 * g0)
     results = []
+    side_counts = {'left': 0, 'right': 0}
     for _, label, out, slotted, kind, region in pre:
+        side = 'right' if 'hero_side=right' in label else 'left'
+        if side_counts[side] >= 16:
+            continue
         # Slotted tags/stamps already sit in the right zone; otherwise they
         # float, but only inside the brand/action zone, clear of the gutters.
         done = out if slotted else _place_floaters(ctx, dict(out), 1.0, Opts(compact=True),
                                                    clearance, region)
         if done is not None:
+            if tight:
+                done = _grow_hero_in_free_space(ctx, done)
             results.append((kind, done, Opts(compact=True), label))
-            if len(results) >= 16:
+            side_counts[side] += 1
+            if all(count >= 16 for count in side_counts.values()):
                 break
     return results
 
@@ -2044,6 +2101,73 @@ def _build_stack(ctx, rows, p, opts, rhythm):
 # ==========================================================================
 # Floaters, decorations, panels, backgrounds
 # ==========================================================================
+
+def _grow_hero_in_free_space(ctx, out):
+    """Grow resolved hero images locally, holding every other element fixed.
+
+    Search obstacle edges as well as the original centre, allowing upward or
+    sideways movement into free space. Use rotated bounds and preserve the
+    extra clearance required by missing-image diagnostic boxes.
+    """
+    out = dict(out)
+    for u in ctx.an.units:
+        if u.role != 'hero' or u.kind != 'image' or u.missing or len(u.ids) != 1:
+            continue
+        index = u.ids[0]
+        if index not in out:
+            continue
+        original = out[index]
+        box = _el_box(original)
+        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+        obstacles = []
+        for other in ctx.an.units:
+            if other is u:
+                continue
+            gap = max(ctx.gmin, ctx.m)
+            if other.missing:
+                gap = max(gap, min(12.0, MISSING_ASSET_GAP_FRACTION * ctx.short))
+            obstacles.extend((_el_box(out[i]), gap) for i in other.ids if i in out)
+        edge = max(2.0, ctx.my)
+        reach = 0.5 * ctx.short
+        scale = original['width'] / ctx.els[index]['width']
+
+        def fit(factor):
+            block = _scaled_block(ctx, u, scale * factor)
+            w, h = block.w, block.h
+            xmin = max(edge, cx - reach - w / 2)
+            xmax = min(ctx.cw - edge - w, cx + reach - w / 2)
+            ymin = max(edge, cy - reach - h / 2)
+            ymax = min(ctx.ch - edge - h, cy + reach - h / 2)
+            if xmin > xmax or ymin > ymax:
+                return None
+            xs = {xmin, xmax, _clamp(cx - w / 2, xmin, xmax)}
+            ys = {ymin, ymax, _clamp(cy - h / 2, ymin, ymax)}
+            for ob, gap in obstacles:
+                xs.update((ob[0] - gap - w, ob[0] + ob[2] + gap))
+                ys.update((ob[1] - gap - h, ob[1] + ob[3] + gap))
+            positions = sorted(((x, y) for x in xs if xmin <= x <= xmax
+                                for y in ys if ymin <= y <= ymax),
+                               key=lambda pos: ((pos[0] + w / 2 - cx) ** 2 +
+                                                (pos[1] + h / 2 - cy) ** 2, pos[1], pos[0]))
+            for x, y in positions:
+                if not any(_hits((x, y, w, h), ob, gap - 1e-6) for ob, gap in obstacles):
+                    return block, x, y
+            return None
+
+        lo, hi = 1.0, min(ctx.cw / box[2], ctx.ch / box[3])
+        best = None
+        for _ in range(12):
+            mid = (lo + hi) / 2
+            found = fit(mid)
+            if found is None:
+                hi = mid
+            else:
+                best, lo = found, mid
+        if best is not None and min(best[0].w - box[2], best[0].h - box[3]) >= 0.5:
+            block, x, y = best
+            _shift(block, x, y, out)
+    return out
+
 
 def _unit_boxes(ctx, out, units):
     res = []
@@ -2315,6 +2439,7 @@ def _score(ctx, out, layout_kind):
     cw, ch = ctx.cw, ctx.ch
     s = 0.0
     hier = []
+    tight_banner = ctx.aspect >= 4.0 and ch <= 120
     for u in an.units:
         if not all(i in out for i in u.ids):
             continue  # a floater not placed yet (zone pre-scoring)
@@ -2327,12 +2452,15 @@ def _score(ctx, out, layout_kind):
             s += imp * math.log(max(f, 1.0) / cap)
             soft = ctx.soft.get(u.role, 8.0)
             if f < soft:
-                s -= imp * 8.0 * ((soft - f) / soft) ** 2
+                # On short strips, readable copy takes priority over visual
+                # size and keeping the original number of text lines.
+                readability_weight = 16.0 if tight_banner else 8.0
+                s -= imp * readability_weight * ((soft - f) / soft) ** 2
             if u.kind == 'text':
                 lines = measure(e, e['width'], e['font_size']).lines
                 limit = {'headline': 3, 'body': 4, 'fine': 3}.get(u.role, 4)
                 if lines > limit:
-                    s -= 0.35 * imp * (lines - limit)
+                    s -= (0.15 if tight_banner else 0.35) * imp * (lines - limit)
             hier.append((src_f, f, imp))
         else:
             boxes = [_el_box(out[i]) for i in u.ids]
@@ -2384,10 +2512,28 @@ def _score(ctx, out, layout_kind):
 
 
 def _banner_terms(ctx, out):
-    """Strip priorities: a readable headline that does not wrap into many
-    lines, a prominent CTA and a showcase-sized hero."""
+    """Strip priorities: readable copy, a prominent CTA and visible imagery.
+
+    Short banners tolerate extra wrapped lines and a smaller hero when that
+    permits larger text; fit and collision checks remain mandatory.
+    """
     s = 0.0
     tight = ctx.ch <= 120
+    if tight:
+        # In near-equal short-banner layouts, prefer copy followed by the
+        # product and brand/action group. Infer order from geometry and roles,
+        # never sample ids. This remains a soft preference: fit is mandatory
+        # and readability penalties can outweigh it on other designs.
+        boxes = [(u, _union(_el_box(out[i]) for i in u.ids))
+                 for u in ctx.an.units if all(i in out for i in u.ids)]
+        copy = [box for u, box in boxes if u.role in ('headline', 'body')]
+        actions = [box for u, box in boxes if u.role in ('logo', 'cta')]
+        heroes = [box for u, box in boxes if u.role == 'hero']
+        if copy and actions and any(
+                all(b[0] + b[2] <= hero[0] + 0.5 for b in copy) and
+                all(b[0] >= hero[0] + hero[2] - 0.5 for b in actions)
+                for hero in heroes):
+            s += BANNER_COPY_FIRST_BONUS
     for u in ctx.an.units:
         if not all(i in out for i in u.ids):
             continue
@@ -2399,7 +2545,13 @@ def _banner_terms(ctx, out):
                 s -= 0.9 * (target - f)
             lines = measure(e, e['width'], e['font_size']).lines
             if lines > 3:
-                s -= 1.0 * (lines - 3)
+                s -= (0.25 if tight else 1.0) * (lines - 3)
+        elif u.role == 'body' and u.kind == 'text' and tight:
+            # Below its readable target, prioritize supporting copy enough
+            # that a larger hero cannot routinely keep it at the size floor.
+            f = float(out[u.text_id]['font_size'])
+            target = min(ctx.soft['body'], ctx.tcap('body', u.font))
+            s -= 1.8 * max(0.0, target - f)
         elif u.role == 'cta' and u.kind == 'pill':
             f = float(out[u.text_id]['font_size'])
             target = min(BANNER_CTA_TARGET, ctx.tcap('cta', u.font))
@@ -2408,7 +2560,7 @@ def _banner_terms(ctx, out):
         elif u.role == 'hero' and tight:
             frac = _union(_el_box(out[i]) for i in u.ids)[3] / ctx.ch
             if frac < 0.8:
-                s -= 4.0 * (0.8 - frac) / 0.8
+                s -= 2.0 * (0.8 - frac) / 0.8
         elif u.role == 'logo' and tight:
             # The brand mark must read: visible logo height ~30% of the strip.
             box = _union(_el_box(out[i]) for i in u.ids)

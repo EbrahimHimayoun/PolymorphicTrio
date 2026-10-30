@@ -68,21 +68,21 @@ def self_check(source: dict, output: dict) -> list[str]:
     return problems
 
 
-def render_to_png(design: dict, assets_dir: Path, png_path: Path) -> None:
+def render_to_png(design: dict, assets_dir: Path, png_path: Path) -> list[str]:
     """Renders `design` to a PNG. Prefers the real renderer
     (transformer-convertor, wrapping cr-renderer) if it's vendored into
     ./renderer; falls back to a plain box-and-label preview otherwise so
     this repo is runnable before that's wired in. Swap the fallback out
     once ./renderer is populated — don't ship the fallback's output as a
-    real preview."""
+    real preview. Returns rendering warnings for the caller to report."""
     try:
         from renderer.converter.convert import render_design_to_png  # type: ignore
-        render_design_to_png(design, assets_dir, str(png_path))
-        return
+        return render_design_to_png(design, assets_dir, str(png_path))
     except ImportError:
         pass
 
     _fallback_render(design, png_path)
+    return ["Official renderer unavailable; generated a box-and-label preview."]
 
 
 def _fallback_render(design: dict, png_path: Path) -> None:
@@ -124,13 +124,17 @@ def main() -> int:
         problems = self_check(source, output)
         stem = task_path.stem
         (OUTPUT_DIR / f"{stem}_output.json").write_text(json.dumps(output, indent=2))
-        render_to_png(output, ASSETS_DIR, OUTPUT_DIR / f"{stem}_output.png")
+        render_warnings = render_to_png(output, ASSETS_DIR, OUTPUT_DIR / f"{stem}_output.png")
 
         status = "OK" if not problems else f"{len(problems)} self-check warning(s)"
+        if render_warnings:
+            status += f"; {len(render_warnings)} render warning(s)"
         print(f"[{task_path.name}] {status} in {elapsed:.2f}s "
               f"-> {stem}_output.json, {stem}_output.png")
         for p in problems:
             print(f"    - {p}")
+        for warning in render_warnings:
+            print(f"    - Render: {warning}")
 
     return exit_code
 
