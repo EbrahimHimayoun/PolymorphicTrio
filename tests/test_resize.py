@@ -18,6 +18,18 @@ ROOT = Path(__file__).resolve().parents[1]
 FONT_MANAGER = load_brand_font_manager(str(ROOT/'brand_kit/fonts'))
 
 
+def metric_fixture(name):
+    """Choose goldens by actual glyph advances, not the operating-system name.
+
+    The pinned Skia builds return fractional advances on macOS and hinted
+    integer advances in the Linux image. Both must satisfy the same content,
+    readability and geometric invariants, but exact coordinates differ.
+    """
+    widths=char_widths(FONT_MANAGER,'Solstice Sans','bold','bold',7,'LIMITED EDITION')
+    suffix='_hinted' if all(float(w).is_integer() for w in widths) else ''
+    return ROOT/'tests/fixtures'/f'{name}{suffix}.json'
+
+
 def extent(e):
     """Independent check: rotate all four actual corners about the center."""
     cx,cy = e['x']+e['width']/2,e['y']+e['height']/2
@@ -167,7 +179,7 @@ class ResizeTests(unittest.TestCase):
 
     def test_level1_baseline_is_preserved(self):
         task=next(task for path,task in fixtures() if 'level1' in path.name)
-        expected=json.loads((ROOT/'tests/fixtures/level1_baseline.json').read_text())
+        expected=json.loads(metric_fixture('level1_baseline').read_text())
         self.assertEqual(resize(task['source'],task['target_canvas']),expected)
 
     def test_growth_never_adds_collisions(self):
@@ -268,7 +280,7 @@ class ResizeTests(unittest.TestCase):
                 self.assertGreaterEqual(by_id[identifier]['font_size'],9)
         # Public resize(), without debug hooks or a manual candidate override,
         # must reproduce the approved copy geometry and enlarged right hero.
-        approved=json.loads((ROOT/'tests/fixtures/level3_approved_geometry.json').read_text())
+        approved=json.loads(metric_fixture('level3_approved_geometry').read_text())
         for identifier,fields in approved.items():
             for key,value in fields.items():
                 if key=='font_size':
@@ -299,6 +311,43 @@ class ResizeTests(unittest.TestCase):
             w,h,_=renderer_measure(e)
             self.assertLessEqual(w,e['width']+1e-5)
             self.assertLessEqual(h,e['height']+1e-5)
+
+    def test_compact_brand_group_keeps_content_and_clearance(self):
+        from engine import resize as engine
+        task=next(task for path,task in fixtures() if 'level3' in path.name)
+        analysis=engine.analyse(task['source'])
+        ctx=engine.Ctx(task['source'],task['target_canvas'],analysis)
+        lanes=engine._lanes(analysis)
+        tags=[u for u in lanes['X'] if u.kind=='pill']
+        stamps=[u for u in lanes['X'] if u.kind!='pill']
+        block=engine._zone_right(ctx,lanes['B'],lanes['A'],lanes['D'],[],
+                                 'compact',2,21.6,10,7,81,tags,stamps,'head')
+        self.assertIsNotNone(block)
+        selected=sorted(block.els)
+        source={'canvas':task['source']['canvas'],
+                'elements':[task['source']['elements'][i] for i,_ in selected]}
+        output={'canvas':{'width':math.ceil(block.w),'height':81},
+                'elements':[e for _,e in selected]}
+        self.assert_valid(source,output)
+        for u in stamps:
+            if not u.missing:continue
+            box=extent(dict(selected)[u.ids[0]])
+            for i,e in selected:
+                if i in u.ids:continue
+                other=extent(e)
+                gap=math.hypot(max(0,box[0]-other[2],other[0]-box[2]),
+                               max(0,box[1]-other[3],other[1]-box[3]))
+                self.assertGreaterEqual(gap,10.8-1e-6)
+
+    def test_glyph_measurements_match_official_renderer(self):
+        from engine import resize as engine
+        for family in ('Solstice Sans','Solstice Serif'):
+            for size in (7,9,13):
+                for weight in ('regular','bold'):
+                    content='Introducing the LIMITED EDITION'
+                    expected=char_widths(FONT_MANAGER,family,weight,weight,size,content)
+                    self.assertEqual(engine._ts().widths(family,weight,weight,size,content),
+                                     tuple(expected))
 
     def test_missing_asset_gets_real_collision_free_space(self):
         source={'canvas':{'width':400,'height':200},'elements':[

@@ -1,3 +1,90 @@
+# Bounded review controller — October 30, 2026
+
+The engine now validates finished geometry after text-fit repair and rounding.
+It keeps score priority for valid candidates, then tries targeted translations
+of whole colliding units on at most six rejected candidates per floor stage,
+with three repair rounds per candidate. Fallback structures use the same gate.
+No model, new dependency, renderer change or new content-editing permission was
+introduced. This first controller reviews geometry, not rendered pixels.
+
+If the bounded search finds no valid result, `LayoutValidationError` carries the
+remaining diagnostics. The CLI continues other tasks and returns a nonzero exit
+code. It does not write new artifacts for a failed task; old files can remain.
+This is a deliberate change from returning a known-invalid fallback, and does
+not prove that an untried feasible arrangement could not exist.
+
+Verified:
+
+- Existing native regression suite: **20 tests passed** in 200.6 seconds,
+  including approved geometry and alternate canvas formats.
+- Linux/amd64 offline regression run with source mounted read-only: **25 tests
+  passed** in 366.9 seconds (the existing 20 plus the first five controller tests).
+  The final seven-test controller suite was also run in the rebuilt image as
+  described below, covering **27 distinct tests** across the verification runs.
+- Seven new controller/CLI regressions passed natively and in the rebuilt
+  Linux/amd64 image with networking disabled. Coverage includes collisions
+  introduced by text repair, rigid group translation, source immutability,
+  deterministic repair, preserved assets, element counts, finite geometry,
+  line limits, valid runner-up selection, explicit failure and batch continuation.
+- All three native samples rendered successfully and their output JSON is
+  identical to the existing approved files in `output/`.
+- Rebuilt `chameleon-review`; the official renderer build smoke test passed.
+- The rebuilt image ran all three samples with `--network none` and no engine
+  source mount. All six JSON/PNG files are byte-identical to the preceding Docker
+  outputs. Case 3 took 41.9 seconds; its deliberately missing asset remains the
+  only rendering warning. Review files are in `/tmp/chameleon-review-loop-docker/`;
+  the submission `output/` directory was not modified.
+
+The loop is bounded and greedy, and may miss feasible layouts. Geometry checks
+retain the existing tolerance, grouping and background policies. Passing the
+gate does not guarantee readable text at extreme sizes or good visual balance.
+
+---
+
+# Docker font-metric regression fix — October 30, 2026
+
+This entry supersedes older test counts, Docker-pending status, and timings below.
+
+The pinned renderer and identical font files produce fractional glyph advances
+on macOS and integer, hinted advances in Linux/amd64. The old search selected an
+11px headline in Docker despite the locally approved 13px headline. No renderer,
+font, asset, or dependency changes were made to address this.
+
+The engine now tries an additional compact brand/action arrangement when the
+usual short-banner candidates miss their copy targets. Badges can occupy two
+rows, and the logo, sale tag and missing-image placeholder share a header with
+measured clearance. The copy-first composition preference remains weaker than
+the headline/body shortfall penalties. Exact test fixtures are selected using
+the official renderer's measured glyph advances, not OS detection in the engine.
+
+Verified:
+
+- Full suite on macOS: **20 tests passed**, approximately 195 seconds.
+- Full suite in Linux/amd64 Docker, `--network none`, current source mounted
+  read-only: **20 tests passed**, approximately 350 seconds. Includes independent
+  bounds, collisions, content preservation, text fit, compact-header clearance,
+  renderer glyph agreement, and metric-specific geometry fixtures.
+- Rebuilt `chameleon-review` from the repository Dockerfile with normal build-time
+  networking. The official-renderer smoke test passed. An initial offline-build
+  attempt lacked a cached dependency layer; offline *runtime* is the requirement.
+- Ran the rebuilt image with `--network none`, mounting only `input/` and an
+  output directory, with no source override. All three samples completed.
+- All six JSON/PNG artifacts from that image are byte-identical to the earlier
+  Linux render using the tested source mount.
+- Case 3 Linux: **13px headline, 9px body, 10px CTA, 7px badges/tag, 6px legal**;
+  product on the right, **55.01px square**. Badges use two rows and the logo is
+  smaller than in the macOS layout. Linux Case 3 takes approximately 40 seconds
+  in this Docker Desktop environment.
+- macOS keeps the approved geometry and text sizes, covered by its existing
+  fractional-metric fixture. Pixel-identical layouts across OSes are not claimed.
+
+The Linux runtime still prints the known Fontconfig warning, and Case 3 still
+reports its intentionally missing artwork. Existing dense-format limitations,
+background-cropping policy questions, and viewer deliverable concerns are not
+resolved by this font-layout fix.
+
+---
+
 # Full test-suite migration — October 28, 2026
 
 The older suite now loads against the current role-aware engine. All layout

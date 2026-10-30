@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from engine.resize import resize
+from engine.resize import resize, LayoutValidationError
 
 # Relative to the current working directory, which is /app both inside the
 # Docker image (WORKDIR /app) and when run locally from this repo's root -
@@ -118,7 +118,14 @@ def main() -> int:
         source, target_canvas = task["source"], task["target_canvas"]
 
         t0 = time.time()
-        output = resize(source, target_canvas)
+        try:
+            output = resize(source, target_canvas)
+        except LayoutValidationError as exc:
+            print(f'[{task_path.name}] FAILED: {exc}', file=sys.stderr)
+            print('    No output written for this task; any existing files are from an earlier run.',
+                  file=sys.stderr)
+            exit_code = 1
+            continue
         elapsed = time.time() - t0
 
         problems = self_check(source, output)

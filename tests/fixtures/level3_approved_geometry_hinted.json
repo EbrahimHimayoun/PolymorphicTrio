@@ -1,0 +1,11 @@
+{
+  "product": {"x": 461.12, "y": 17.5, "width": 55.01, "height": 55.01},
+  "headline": {"x": 17.63, "y": 6.64, "width": 269.0, "height": 63.45, "font_size": 13},
+  "subhead": {"x": 299.11, "y": 5.07, "width": 156.0, "height": 66.6, "font_size": 9},
+  "badge1_label": {"x": 532.23, "y": 57.42, "width": 66.0, "height": 9.8, "font_size": 7},
+  "badge2_label": {"x": 614.33, "y": 57.42, "width": 89.0, "height": 9.8, "font_size": 7},
+  "badge3_label": {"x": 591.28, "y": 73.52, "width": 53.0, "height": 9.8, "font_size": 7},
+  "cta_label": {"x": 554.78, "y": 36.33, "width": 126.0, "height": 14.0, "font_size": 10},
+  "ribbon_label": {"x": 609.12, "y": 13.05, "width": 50.0, "height": 9.8, "font_size": 7},
+  "legal_text": {"x": 67.61, "y": 76.53, "width": 339.0, "height": 8.4, "font_size": 6}
+}

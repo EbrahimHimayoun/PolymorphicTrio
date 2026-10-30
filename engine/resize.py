@@ -37,8 +37,9 @@ Pipeline
 4. Validation and scoring. Every candidate is checked for canvas bounds,
    unit-to-unit collisions (rotated boxes included), measured text fit and
    image proportions, then scored on readability, hierarchy, visual weight,
-   coverage and balance. If nothing validates, a conservative shrink-to-fit
-   fallback is used, and a final repair pass guarantees bounds and text fit.
+   coverage and balance. Finished geometry is validated again after repair.
+   A bounded review loop moves colliding units together, then tries fallback
+   structures. If no result passes, LayoutValidationError reports the failure.
 
 Content, font family, colours, assets, z-order and rotation are never
 changed; only geometry, font size (integer, as rendered) and size-dependent
@@ -1462,7 +1463,7 @@ def _build_columns(ctx, cols, p, opts, floaters_inline):
 
 BANNER_HEADLINE_TARGET = 14   # px: preferred minimum headline size on strips
 BANNER_CTA_TARGET = 11        # px: preferred minimum CTA label size on strips
-BANNER_COPY_FIRST_BONUS = 0.1  # small composition preference, below font-size penalties
+BANNER_COPY_FIRST_BONUS = 0.6  # composition preference, below headline/body shortfall penalties
 
 
 def _zone_eligible(ctx):
@@ -1583,7 +1584,7 @@ def _zone_copy(ctx, units, width, H, align, cache, split=None):
     return cache[key]
 
 
-def _hrow(blocks, sep):
+def _hrow(blocks, sep, top_align=False):
     """Blocks side by side, vertically centred; returns one Block."""
     h = max(b.h for b in blocks)
     items, x = [], 0.0
@@ -1591,7 +1592,7 @@ def _hrow(blocks, sep):
         for i, e in b.els:
             e2 = dict(e)
             e2['x'] += x
-            e2['y'] += (h - b.h) / 2
+            e2['y'] += 0.0 if top_align else (h - b.h) / 2
             items.append((i, e2))
         x += b.w + sep
     return Block(x - sep, h, items, None, max(b.font for b in blocks), 'row')
@@ -1608,6 +1609,8 @@ def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size,
     CTA, which keeps the logo row narrow."""
     top = []
     head = []
+    compact = mode == 'compact'
+    header_missing_height = 0.0
     for u in logos:
         sc = min(logo_h / max(u.box[3], 1e-6), 0.3 * ctx.cw / max(u.box[2], 1e-6),
                  H / max(u.box[3], 1e-6))
@@ -1617,16 +1620,31 @@ def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size,
         head.append(b)
     tag_blocks = []
     for u in tags:
-        size = max(ctx.floor(u.role, u.font), badge_size or 0, (cta_size or 0) - 2)
+        size = max(ctx.floor(u.role, u.font), badge_size or 0,
+                   0 if compact else (cta_size or 0) - 2)
         b = _pill_block(ctx, u, size, True) if u.kind == 'pill' else None
         if b is None:
             return None
         tag_blocks.append(b)
     if slot == 'head':
         head += tag_blocks
+    if compact:
+        # Put small corner assets beside the brand, leaving the lower rows
+        # for action and wrapped badges. Top alignment keeps a diagnostic
+        # image clear of the CTA even when the rotated tag is taller.
+        for u in stamps:
+            b = _scaled_block(ctx, u, 0.18 * ctx.ch / max(u.box[3], 1e-6))
+            if b is None:
+                return None
+            head.append(b)
+            if u.missing:
+                header_missing_height = max(header_missing_height, b.h)
     if head:
         # Brand and its sale tag share the top row, clear of the CTA below.
-        top.append(_hrow(head, max(ctx.gmin * 2, 0.6 * (cta_size or 8))) if len(head) > 1 else head[0])
+        sep = max(ctx.gmin * 2, 0.6 * (cta_size or 8))
+        if header_missing_height:
+            sep = max(sep, min(12.0, MISSING_ASSET_GAP_FRACTION * ctx.short))
+        top.append(_hrow(head, sep, top_align=compact) if len(head) > 1 else head[0])
     for u in ctas:
         b = (_pill_block(ctx, u, cta_size, True) if u.kind == 'pill'
              else _text_unit_block(ctx, u, cta_size, None))
@@ -1643,7 +1661,10 @@ def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size,
             if u.missing and top:
                 missing_gaps.append(len(top) - 1)
             top.append(b)
-    gaps = [max(ctx.gmin, 0.4 * (cta_size or 8))] * max(0, len(top) - 1)
+    gaps = [ctx.gmin if compact else max(ctx.gmin, 0.4 * (cta_size or 8))] * max(0, len(top) - 1)
+    if header_missing_height and gaps:
+        gaps[0] = max(gaps[0], header_missing_height +
+                      min(12.0, MISSING_ASSET_GAP_FRACTION * ctx.short) - top[0].h)
     # Unresolved assets render as opaque diagnostic boxes, not transparent
     # artwork. Give them their own visual breathing room; if the stack no
     # longer fits, candidate selection can choose another logo size/layout.
@@ -1657,7 +1678,7 @@ def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size,
             return None
         bblocks.append(b)
     row_h = max((b.h for b in bblocks), default=0.18 * ctx.ch)
-    if slot == 'head':
+    if slot == 'head' and not compact:
         for u in stamps:
             b = _scaled_block(ctx, u, min(1.2 * row_h, stamp_h) / max(u.box[3], 1e-6))
             if b is None:
@@ -1688,7 +1709,7 @@ def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size,
                         for i in range(0, len(bblocks), k))
             if blocks:
                 # A clear band below the CTA so badges never crowd it.
-                bgaps.append(max(ctx.gmin * 1.5, 0.7 * (cta_size or badge_size or 8)))
+                bgaps.append(ctx.gmin if compact else max(ctx.gmin * 1.5, 0.7 * (cta_size or badge_size or 8)))
             blocks.append(_flow(bblocks, width, bg))
     if fine:
         width = max((b.w for b in blocks), default=0.3 * ctx.cw)
@@ -1753,7 +1774,7 @@ def _zone_configs(ctx, tight):
         yield fp, bp, mode, k, lf, cs, bsz, fm
 
 
-def _zones_candidates(ctx):
+def _zones_candidates(ctx, compact=False):
     lanes = ctx.lanes
     hero = lanes['V'][0]
     cw, ch = ctx.cw, ctx.ch
@@ -1768,6 +1789,13 @@ def _zones_candidates(ctx):
     tags = [u for u in lanes['X'] if u.kind == 'pill']
     stamps = [u for u in lanes['X'] if u.kind != 'pill']
     configs = list(_zone_configs(ctx, tight))
+    if compact:
+        cta_sizes, badge_sizes = _zone_size_options(ctx, tight)
+        rows = sorted({max(1, (len(badges) + 1) // 2), max(1, len(badges))})
+        configs = [(fp, 'right', 'compact', k, lf, cs, badge_sizes[0], 'head')
+                   for fp, k, lf, cs in itertools.product(
+                       ('copy', 'strip', 'right') if fine else ('none',),
+                       rows, (0.24, 0.28), cta_sizes)]
     copy_cache, strip_cache = {}, {}
     pre = []
     # Keep the original showcase layouts, but also let measured copy compete
@@ -1861,6 +1889,17 @@ def _zones_candidates(ctx):
             side_counts[side] += 1
             if all(count >= 16 for count in side_counts.values()):
                 break
+    if tight and not compact:
+        # Font rasterizers can have different advances even with identical
+        # font files. Only expand the packing search when no normal candidate
+        # meets the copy targets measured by the renderer in this environment.
+        copy = [u for u in copy_units if u.kind == 'text' and u.role in ('headline', 'body')]
+        def readable(out):
+            return all(out[u.text_id]['font_size'] >= min(
+                BANNER_HEADLINE_TARGET - 1 if u.role == 'headline' else ctx.soft['body'],
+                int(ctx.tcap(u.role, u.font))) for u in copy)
+        if copy and not any(readable(out) for _, out, _, _ in results):
+            results += _zones_candidates(ctx, compact=True)
     return results
 
 
@@ -2716,6 +2755,119 @@ def _repair(ctx, out):
 # Driver
 # ==========================================================================
 
+class LayoutValidationError(ValueError):
+    """The bounded search could not produce a verified layout."""
+
+    def __init__(self, problems):
+        self.problems = tuple(problems)
+        super().__init__(f'No valid layout found after bounded repair: {self.problems[:8]}')
+
+
+def _final_problems(ctx, out):
+    """Validate geometry and preserved fields on the actual returned elements.
+
+    Keep the existing background fit/rotation policy; this gate does not
+    introduce new asset or typography permissions.
+    """
+    problems = []
+    if set(out) != set(range(len(ctx.els))):
+        problems.append(('element_count',))
+    for i, src in enumerate(ctx.els):
+        e = out.get(i)
+        if e is None:
+            problems.append(('missing', i))
+            continue
+        allowed = {'x', 'y', 'width', 'height', 'font_size',
+                   'corner_radius', 'stroke_width', 'letter_spacing'}
+        if i in ctx.an.backgrounds:
+            allowed |= {'rotation', 'fit'}
+        for key in sorted(set(src) | set(e)):
+            if key not in allowed and (key not in src or key not in e or src[key] != e[key]):
+                problems.append(('preservation', i, key))
+        for key in ('x', 'y', 'width', 'height'):
+            value = e.get(key)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                problems.append(('geometry', i, key))
+            elif key in ('width', 'height') and value < 0:
+                problems.append(('geometry', i, key))
+        if e.get('type') == 'text':
+            f = e.get('font_size')
+            if not isinstance(f, (int, float)) or not math.isfinite(f) or f < 1:
+                problems.append(('font_size', i))
+    if problems:
+        return problems
+    problems = _problems(ctx, out)
+    for i, e in out.items():
+        if e['type'] == 'text' and e.get('max_lines'):
+            if measure(e, e['width'], e['font_size']).lines > int(e['max_lines']):
+                problems.append(('max_lines', i))
+    return problems
+
+
+def _review_and_repair(ctx, out, rounds=3):
+    """Repair fit, then resolve collisions by translating whole layout units.
+
+    At most three greedy rounds, eight collisions per round, and eight edge
+    moves per collision. Every accepted move strictly improves diagnostics.
+    Inputs are never mutated; content, sizes and group-relative positions
+    remain fixed during collision repair.
+    """
+    best = _repair(ctx, dict(out))
+    problems = _final_problems(ctx, best)
+    units = {u.uid: u for u in ctx.an.units}
+    for _ in range(rounds):
+        if not problems:
+            break
+        rank = (len(problems), _collision_area(ctx, best))
+        choice = None
+        for _, a, b in [p for p in problems if p[0] == 'overlap'][:8]:
+            for uid, other in ((a, b), (b, a)):
+                unit, obstacle = units[uid], units[other]
+                x, y, w, h = _union(_el_box(best[i]) for i in unit.ids)
+                ox, oy, ow, oh = _union(_el_box(best[i]) for i in obstacle.ids)
+                for dx, dy in ((ox - x - w - 0.5, 0), (ox + ow - x + 0.5, 0),
+                               (0, oy - y - h - 0.5), (0, oy + oh - y + 0.5)):
+                    if x + dx < 0 or y + dy < 0 or x + dx + w > ctx.cw or y + dy + h > ctx.ch:
+                        continue
+                    trial = dict(best)
+                    for i in unit.ids:
+                        trial[i] = dict(best[i], x=round(best[i]['x'] + dx, 2),
+                                        y=round(best[i]['y'] + dy, 2))
+                    issues = _final_problems(ctx, trial)
+                    trial_rank = (len(issues), _collision_area(ctx, trial))
+                    if trial_rank < rank:
+                        choice, rank = (trial, issues), trial_rank
+        if choice is None:
+            break
+        best, problems = choice
+    return best, problems
+
+
+def _select_reviewed(ctx, candidates):
+    """Preserve score order for valid layouts; only repair rejected runners-up."""
+    valid, rejected = [], []
+    for kind, full, label in candidates:
+        problems = _problems(ctx, full)
+        if problems:
+            rejected.append((len(problems), _collision_area(ctx, full), kind, full))
+        else:
+            sc = _score(ctx, full, kind)
+            valid.append((sc, full))
+            if _DEBUG is not None:
+                _DEBUG.append((sc, f'{label} floors={ctx.floor_mult}', full))
+    for _, full in sorted(valid, key=lambda item: -item[0]):
+        finished, problems = _review_and_repair(ctx, full, rounds=0)
+        if not problems:
+            return finished
+        rejected.append((len(problems), _collision_area(ctx, finished), '', finished))
+    repaired = []
+    for _, _, kind, full in sorted(rejected, key=lambda item: item[:2])[:6]:
+        finished, problems = _review_and_repair(ctx, full)
+        if not problems:
+            repaired.append((_score(ctx, finished, kind), finished))
+    return max(repaired, key=lambda item: item[0])[1] if repaired else None
+
+
 def _candidates(ctx):
     an = ctx.an
     units = an.units
@@ -2842,36 +2994,29 @@ def resize(source, target_canvas):
     ctx = Ctx(source, {'width': cw, 'height': ch}, an)
     ctx.lanes = _lanes(an)
 
-    best, best_score = None, None
+    best = None
     # Readability floors relax in stages only when nothing fits (tiny canvases
     # with a lot of copy); the first stage that yields a valid layout wins.
     for floor_mult in (1.0, 0.8, 0.62, 0.48, 0.36, 0.25):
         ctx.floor_mult = floor_mult
-        for kind, out, opts, label in _candidates(ctx):
-            full = _complete(ctx, out, kind)
-            if _problems(ctx, full):
-                continue
-            sc = _score(ctx, full, kind)
-            if _DEBUG is not None:
-                _DEBUG.append((sc, f'{label} floors={floor_mult}', full))
-            if best_score is None or sc > best_score:
-                best, best_score = full, sc
+        candidates = [(kind, _complete(ctx, out, kind), label)
+                      for kind, out, opts, label in _candidates(ctx)]
+        best = _select_reviewed(ctx, candidates)
         if best is not None:
             break
     if best is None:
-        # Nothing validates (extreme canvas for the amount of content). Prefer
-        # the structured candidate with the least collision area over a plain
-        # scaled copy of the source; bounds and text fit are still enforced.
+        # Try alternate structures, applying the same final validation gate.
         options = [_complete(ctx, _fallback(ctx)), _complete(ctx, _grid_fallback(ctx))]
-        for kind, out, opts, label in _candidates(ctx):
-            options.append(_complete(ctx, out, kind))
-        best = min(options, key=lambda o: _collision_area(ctx, o))
-    best = _repair(ctx, best)
+        best = _select_reviewed(ctx, [('fallback', o, 'fallback') for o in options])
+        if best is None:
+            reviewed = [_review_and_repair(ctx, o) for o in options]
+            _, problems = min(reviewed, key=lambda item: (len(item[1]), _collision_area(ctx, item[0])))
+            raise LayoutValidationError(problems)
+    problems = _final_problems(ctx, best)
+    if problems:
+        raise LayoutValidationError(problems)
 
     elements = []
     for i, src in enumerate(els):
-        e = best.get(i)
-        if e is None:  # never expected; keep the element rather than drop it
-            e = dict(src)
-        elements.append(e)
+        elements.append(best[i])
     return {'canvas': {'width': cw, 'height': ch}, 'elements': elements}
