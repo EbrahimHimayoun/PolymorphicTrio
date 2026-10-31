@@ -20,7 +20,7 @@ def image(identifier, x, y, size=20):
 
 def context(elements, groups=None, width=100, height=100):
     units = [Unit(n, ids) for n, ids in enumerate(groups or [[i] for i in range(len(elements))])]
-    return SimpleNamespace(els=elements, cw=width, ch=height, floor_mult=1,
+    return SimpleNamespace(els=elements, cw=width, ch=height, floor_mult=1, organization_groups=[],
                            an=SimpleNamespace(units=units, backgrounds=[]))
 
 
@@ -70,7 +70,7 @@ class ReviewTests(unittest.TestCase):
         ctx = context(elements)
         corrupted = {0: dict(elements[0], asset_id='replacement.png')}
         valid = {0: dict(elements[0])}
-        with patch('engine.resize._score', side_effect=lambda ctx, out, kind: 100 if kind == 'bad' else 0):
+        with patch('engine.resize._score', side_effect=lambda ctx, out, kind, **kw: 100 if kind == 'bad' else 0):
             result = _select_reviewed(ctx, [('bad', corrupted, ''), ('good', valid, '')])
         self.assertEqual(result, valid)
 

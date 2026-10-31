@@ -22,6 +22,9 @@ venv/
 output/*
 !output/.gitkeep
 
+# Reproducible submission archives and staging files
+/dist/
+
 # Local credentials and environment files
 .aws/
 .env

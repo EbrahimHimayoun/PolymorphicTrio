@@ -1,22 +1,22 @@
-"""CHAMELEON resize engine: role-aware reflow with renderer-exact typesetting.
+"""CHAMELEON resize engine: role-aware reflow with renderer-compatible metrics.
 
 resize(source, target_canvas) -> design   (same ids, same count, same order)
 
 Pipeline
 --------
-1. Typesetting model. Text is measured with the *same* fonts, the same
-   integer font size, the same space-only greedy wrap and the same per-span
-   advance rule as the official renderer (renderer/converter + cr-renderer),
-   including style runs, letter spacing and real ascent/descent. A text box
-   the engine emits therefore renders with exactly the line breaks the engine
-   planned. (Measuring at one size and scaling is wrong at banner sizes:
-   skia hints advances to whole pixels, so small text runs ~10% wider.)
+1. Typesetting model. With Skia and the official font manager available, use
+   the renderer's font lookup and space-only greedy wrap, integer font sizes,
+   per-span advances, style runs, letter spacing and ascent/descent metrics.
+   Measure each candidate size directly: hinting and rounding can change glyph
+   advances, and macOS/Linux metrics can differ. Pillow provides an approximate
+   fallback when the renderer stack cannot be initialized.
 
-2. Analysis. The source is split into background(s), low-opacity
-   decorations, panels and layout *units*: a single text, a label+shape pill,
+2. Analysis. The source is split into background(s), decorations, panels
+   and layout *units*: a single text, a label+shape pill,
    an image, or a rigid group (anything else that shares a group_id or is
-   geometrically contained). Every unit gets a role inferred only from
-   geometry, typography and z-order -- never from ids, notes or asset names:
+   geometrically contained). Roles use geometry, typography, grouping, text
+   length and asset availability; IDs, notes and asset names are not read as
+   semantic labels. Inferred roles include:
    headline, body, fine print, CTA, badge, tag (rotated pill), hero, logo,
    image, stamp (small corner image), group.
 
@@ -29,21 +29,28 @@ Pipeline
      columns built from lanes -- brand, visual, copy, action -- in several
      orders, with fine print either under the copy or as a full-width strip.
      Small rotated tags and corner stamps float into measured free space.
-   Each candidate binary-searches one pressure value p in (0, 1]. Text shrinks
-   with role-specific elasticity (headline and CTA hold their size longest,
-   badges and fine print give way first, each with a hard floor), images
-   scale with p and fill their column height, pills compact their padding.
+   Stack and column searches vary a shared pressure value; banner candidates
+   also vary zone sizes, copy splits, badge wrapping and hero position. Text
+   uses role-specific elasticity and staged size floors; fitting helpers and
+   last-resort repair can reduce sizes further. Banner copy can grow one pixel
+   at a time within its available space and size caps.
 
-4. Validation and scoring. Every candidate is checked for canvas bounds,
-   unit-to-unit collisions (rotated boxes included), measured text fit and
-   image proportions, then scored on readability, hierarchy, visual weight,
-   coverage and balance. Finished geometry is validated again after repair.
-   A bounded review loop moves colliding units together, then tries fallback
-   structures. If no result passes, LayoutValidationError reports the failure.
+4. Validation and scoring. Some candidates are pre-ranked before completion.
+   Completed layouts are checked for bounds, independent-unit collisions using
+   rotated enclosing boxes, measured text fit and foreground-image proportions.
+   Scoring weighs readability, hierarchy, visual weight, coverage and balance.
+   A source-informed organization penalty may reorder valid candidates only
+   without increasing any text/pill unit's preferred-size shortfall relative
+   to the best candidate under the base score. Finished geometry is checked
+   again after repair. Bounded recovery translates whole colliding units;
+   fallback structures use the same final gate. If none passes within the
+   validator's tolerances, LayoutValidationError reports the remaining issues.
 
-Content, font family, colours, assets, z-order and rotation are never
-changed; only geometry, font size (integer, as rendered) and size-dependent
-style values (corner radius, stroke width, letter spacing) are.
+Content, font families, colours, asset references and z-order are preserved.
+Geometry, integer font sizes and size-dependent style values may change.
+Foreground rotation is preserved; full-canvas backgrounds are reset to zero
+rotation and image backgrounds use fit='cover'. Original asset files are not
+modified. Passing validation does not establish optimal layout or readability.
 """
 from __future__ import annotations
 
@@ -58,13 +65,14 @@ _FONTS_DIR = _ROOT / 'brand_kit' / 'fonts'
 _ASSETS_DIR = _ROOT / 'brand_kit' / 'assets'
 
 # --------------------------------------------------------------------------
-# Tunables (pixel values are in target-canvas pixels)
+# Tunables (size values are in target-canvas pixels; weights are dimensionless)
 # --------------------------------------------------------------------------
 
 # How strongly each text role resists shrinking (text = cap * p ** exponent).
 TEXT_ELASTICITY = {'headline': 1.0, 'cta': 1.0, 'body': 1.12, 'badge': 1.3,
                    'tag': 1.3, 'fine': 1.3, 'label': 1.1}
-# Hard floors: below these the engine prefers another layout.
+# Starting size floors, capped by source-derived limits and relaxed in stages.
+# Text-fitting helpers and last-resort repair may go below these preferences.
 TEXT_FLOOR = {'headline': 9, 'cta': 9, 'body': 7, 'badge': 7, 'tag': 7,
               'fine': 6, 'label': 7}
 # Weight of each role in the layout score.
@@ -72,6 +80,9 @@ IMPORTANCE = {'divider': 0.2, 'headline': 3.0, 'cta': 2.2, 'hero': 1.8, 'logo': 
               'body': 1.5, 'group': 1.4, 'image': 1.0, 'badge': 0.8,
               'tag': 0.7, 'shape': 0.4, 'stamp': 0.35, 'fine': 0.5,
               'label': 1.0}
+
+# A bounded preference, never a placement rule or a readability floor.
+ORGANIZATION_WEIGHT = 2.0
 
 # Extra breathing room for the official opaque missing-image diagnostic box.
 MISSING_ASSET_GAP_FRACTION = 0.12  # capped at 12 target pixels
@@ -175,9 +186,9 @@ class _Typesetter:
     """Glyph advances and vertical metrics, preferring the renderer's stack.
 
     Primary path: the brand-kit FontManager the official converter builds and
-    skia, exactly as the renderer measures and draws. Fallback (renderer not
-    installed): Pillow with the brand-kit TTFs, advances rounded up so the
-    estimate errs on the wide side.
+    Skia. If initialization fails, use Pillow and local brand fonts, rounding
+    character advances up. That fallback approximates the renderer; rounding
+    alone does not guarantee its measurements exceed Skia's.
     """
 
     def __init__(self):
@@ -282,7 +293,7 @@ def _ts():
 
 
 def _wrap(text, widths, max_width):
-    """Byte-for-byte copy of renderer.converter.wrap.wrap_text."""
+    """Match the official wrapper's greedy replacement of spaces by newlines."""
     if not text or max_width <= 0:
         return text
     chars = list(text)
@@ -326,7 +337,7 @@ def _text_key(e):
 
 
 def measure(e, width, size):
-    """Lay out text element `e` exactly as the renderer will at (width, size)."""
+    """Measure wrapped text using the renderer model, or the Pillow fallback."""
     size = int(size)
     key = (_text_key(e), round(float(width), 3), size)
     hit = _FIT_CACHE.get(key)
@@ -405,7 +416,7 @@ def natural_width(e, size):
 
 
 def _shrink_wrap(e, width, size):
-    """Narrowest box width that renders with the same line breaks as `width`."""
+    """Try a tighter width while retaining the measured line count and fit."""
     fit = measure(e, width, size)
     tight = math.floor(min(width, fit.max_w + fit.space_w + 1.0) * 100) / 100
     if tight < width:
@@ -432,7 +443,7 @@ def _text_ok(e, width, size, max_height=None):
 
 @lru_cache(maxsize=128)
 def _asset_info(asset_id):
-    """(width, height, alpha bbox) of a brand-kit asset, or None if missing."""
+    """Return asset dimensions/alpha bounds, or None if missing or unreadable."""
     if not asset_id:
         return None
     path = _ASSETS_DIR / str(asset_id)
@@ -451,7 +462,10 @@ def _asset_info(asset_id):
 
 
 def _visible_fraction(e):
-    """Fraction (x0, y0, x1, y1) of an image box that shows opaque pixels."""
+    """Estimate occupied image-box fractions from asset alpha bounds and fit.
+
+    Missing/unreadable assets and empty alpha bounds use a full-box estimate.
+    """
     info = _asset_info(e.get('asset_id'))
     w, h = max(e['width'], 1e-6), max(e['height'], 1e-6)
     if info is None:
@@ -846,6 +860,23 @@ class Ctx:
         self.short, self.long = min(cw, ch), max(cw, ch)
         self.m = max(min(6.0, 0.08 * self.short), 0.04 * self.short)
         self.floor_mult = 1.0
+        self.organization_groups = []
+        for roles in ({'badge'}, {'logo', 'cta', 'badge'}):
+            related = [u for u in an.units if u.role in roles]
+            spacing = roles == {'badge'}
+            members = [[u] for u in related if spacing or u.role != 'badge']
+            badges = [u for u in related if u.role == 'badge']
+            if not spacing and badges:
+                # Evaluate the badge cluster as a whole against brand/action;
+                # individual badges must not mask a misaligned logo or CTA.
+                members.append(badges)
+            if len(members) >= 3:
+                source_cost = _arrangement_cost(tuple(tuple(_union(u.box for u in group))
+                                                      for group in members), spacing)
+                # Only preserve organization for which the source is evidence.
+                if source_cost <= 0.35:
+                    self.organization_groups.append((tuple(tuple(i for u in group for i in u.ids)
+                                                           for group in members), source_cost, spacing))
         self.mx = max(self.m, min(0.02 * cw, 2.5 * self.m))
         self.my = self.m
         self.gap = max(self.m * 0.5, min(0.022 * cw, 2.5 * self.m)) if cw >= ch else max(self.m * 0.5, 0.02 * ch)
@@ -863,8 +894,10 @@ class Ctx:
 
     # -- sizing policy -------------------------------------------------------
     def tcap(self, role, src_font):
-        """Largest size a text may take: its proportional size, lifted toward
-        the role's readable size on small canvases (at most 1.8x)."""
+        """Source-scaled size cap, raised toward the role preference if needed.
+
+        Any increase is limited to 1.8 times the source-scaled base size.
+        """
         base = src_font * self.s_txt
         return max(base, min(self.soft.get(role, 8.0), 1.8 * base))
 
@@ -882,7 +915,11 @@ class Ctx:
 
 
 def _text_unit_block(ctx, u, size, width, shrink=True):
-    """Single text element at `size`, wrapped at `width` (None = natural)."""
+    """Fit text starting at `size`; width=None uses its natural line width.
+
+    Reduce font size if needed for width/line limits. By default, also try to
+    tighten the resulting box width without changing its measured line count.
+    """
     src = ctx.els[u.text_id]
     e = dict(src)
     k = size / max(float(src['font_size']), 1e-6)
@@ -985,9 +1022,8 @@ def _scaled_block(ctx, u, scale):
                 fit = measure(e, _floor2(e['width']), size)
             e['font_size'] = size
             e['width'] = _floor2(e['width'])
-            # The renderer draws text top-aligned, so trimming a loose box to
-            # its measured ink height changes nothing visible -- it only stops
-            # empty box area from registering as a collision.
+            # Use measured text height rather than loose source-box height
+            # when calculating block extents and candidate collisions.
             e['height'] = _ceil2(fit.height)
             min_font = size if min_font is None else min(min_font, size)
         items.append((i, e))
@@ -999,7 +1035,10 @@ def _scaled_block(ctx, u, scale):
 
 
 def _flow(blocks, width, gap):
-    """Wrap small blocks into centred rows within `width`. Returns a Block."""
+    """Wrap nonempty blocks into centred rows using `width` as the row limit.
+
+    Individual oversized blocks are not shrunk here; callers must check fit.
+    """
     rows, row, used = [], [], 0.0
     for b in blocks:
         need = b.w if not row else used + gap + b.w
@@ -1141,7 +1180,7 @@ def _similar_visuals(units):
 
 
 def _grid_block(ctx, units, scale, opts, width, hmax, exact=False):
-    """Similar visuals on a common scale, `per` per row, centred rows."""
+    """Scale visuals uniformly into centred rows using opts.grid_per or one row."""
     n = len(units)
     per = min(n, opts.grid_per or n)
     rows = [units[i:i + per] for i in range(0, n, per)]
@@ -1289,7 +1328,10 @@ def _column(ctx, pieces, p, opts, width, H, align='center'):
 # ==========================================================================
 
 def _search(build, iters=14):
-    """Largest p in (0, 1] for which build(p) succeeds."""
+    """Binary-search a feasible pressure, assuming feasibility is monotone.
+
+    Return the best layout sampled, including p=0, or None if that also fails.
+    """
     top = build(1.0)
     if top is not None:
         return top
@@ -1449,17 +1491,13 @@ def _build_columns(ctx, cols, p, opts, floaters_inline):
 
 # ---------------- extreme banners: three-zone solver ----------------------
 #
-# Strips of aspect >= 4 (leaderboards, LinkedIn/Twitter-style headers) get a
-# designed three-zone composition rather than generic columns:
-#   left   the hero visual, 80-88% of the canvas height, vertically centred
-#   centre the copy stack: the headline is sized first, then subhead and fine
-#          print grow within hierarchy caps
-#   right  brand and action: logo on top, CTA below it, badges set apart
-#          below the CTA (or in a side column); tags and stamps float into
-#          free space with a generous clearance
-# Wide gutters separate the zones. Zone widths are not fixed percentages: the
-# centre takes what the copy needs so the headline is not forced into many
-# narrow lines, and the search weighs that against hero, logo and CTA sizes.
+# Eligible strips (aspect >= 4, one visual unit and standalone copy) add zone
+# candidates alongside generic columns. Hero, copy and brand/action regions
+# compete for width. Short strips try the hero before or after copy, several
+# hero sizes/gutters, parallel copy columns and compact badge/header packing.
+# Hero growth can then use nearby free space. Brand/action regions can stack
+# or split; tags/stamps are either slotted or placed in remaining free space.
+# Candidate validation and scoring decide which sampled arrangement wins.
 
 BANNER_HEADLINE_TARGET = 14   # px: preferred minimum headline size on strips
 BANNER_CTA_TARGET = 11        # px: preferred minimum CTA label size on strips
@@ -1489,15 +1527,12 @@ def _vstack(blocks, gaps, align='center'):
 
 
 def _zone_copy(ctx, units, width, H, align, cache, split=None):
-    """Centre zone copy stack, sized in two passes.
+    """Fit zone copy as a stack or split columns, then greedily grow text.
 
-    1. The largest common scale p at which everything fits, using each role's
-       elasticity (headline and CTA hold their size longest, fine print gives
-       way first), so the source hierarchy is preserved.
+    1. Search a fitting common pressure using role elasticity and size floors.
     2. Leftover room is shared out one pixel at a time, round-robin: headline,
        body, fine print, badges -- each within a cap relative to the headline.
-       On tight strips the supporting copy sits at its floors after pass 1, so
-       this is where the headline reaches the largest size that still fits.
+       This encourages hierarchy without guaranteeing a globally optimal fit.
     """
     key = (tuple(u.uid for u in units), width, H, align, split)
     if key in cache:
@@ -1558,7 +1593,7 @@ def _zone_copy(ctx, units, width, H, align, cache, split=None):
     if ctx.aspect >= 4.0 and ctx.ch <= 120:
         # Compress the typographic hierarchy on short banners: supporting
         # copy can use its available space independently of headline growth.
-        # The headline remains larger; renderer measurements still gate fit.
+        # Relative caps limit further body growth; measurements still gate fit.
         caps['body'] = 0.85
     order = sorted(texts, key=lambda u: list(caps).index(u.role) if u.role in caps else 9)
     grow = [u for u in order if u.role in caps]
@@ -1585,7 +1620,7 @@ def _zone_copy(ctx, units, width, H, align, cache, split=None):
 
 
 def _hrow(blocks, sep, top_align=False):
-    """Blocks side by side, vertically centred; returns one Block."""
+    """Place blocks side by side, centred vertically or optionally top-aligned."""
     h = max(b.h for b in blocks)
     items, x = [], 0.0
     for b in blocks:
@@ -1600,13 +1635,15 @@ def _hrow(blocks, sep, top_align=False):
 
 def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size, badge_size, H,
                 tags=(), stamps=(), slot='head'):
-    """Right zone: logo on top, CTA below, badges set apart below the CTA
-    ('stack') or in a side column ('split'), fine print last.
+    """Build the brand/action zone as a stack, split columns or compact stack.
 
     Tags and stamps get designed slots instead of leftover space:
     slot 'head' puts tags beside the logo and stamps in the badge group;
     slot 'col' puts tags at the head of the badge group and stamps under the
-    CTA, which keeps the logo row narrow."""
+    CTA. Compact mode puts stamps in the top-aligned brand/tag header and uses
+    tighter gaps with extra clearance for missing-image placeholders. Badges
+    can wrap into rows; fine print is appended last when supplied here.
+    """
     top = []
     head = []
     compact = mode == 'compact'
@@ -1708,7 +1745,7 @@ def _zone_right(ctx, logos, ctas, badges, fine, mode, per_row, logo_h, cta_size,
             width = max(sum(b.w for b in bblocks[i:i + k]) + bg * (len(bblocks[i:i + k]) - 1)
                         for i in range(0, len(bblocks), k))
             if blocks:
-                # A clear band below the CTA so badges never crowd it.
+                # Separate the badge block from the preceding brand/action stack.
                 bgaps.append(ctx.gmin if compact else max(ctx.gmin * 1.5, 0.7 * (cta_size or badge_size or 8)))
             blocks.append(_flow(bblocks, width, bg))
     if fine:
@@ -1748,13 +1785,13 @@ def _zone_size_options(ctx, tight):
 
 
 def _zone_configs(ctx, tight):
-    """Every structural option the zone solver explores."""
+    """Yield normal zone configurations; compact mode builds its own set."""
     lanes = ctx.lanes
     fine, badges, logos = lanes['F'], lanes['D'], lanes['B']
     n_b = len(badges)
     per_rows = sorted({n_b, max(1, (n_b + 1) // 2), 1}) if n_b > 1 else [None]
-    # The logo never shrinks below about a third of the strip: a brand mark
-    # that reads as a speck is worse than a slightly smaller headline.
+    # Sample prominent logo heights before width/height fitting caps apply.
+    # The separate compact branch also tries smaller header logos.
     logo_fracs = (0.48, 0.4, 0.32) if tight else (0.34, 0.26, 0.2)
     cta_sizes, badge_sizes = _zone_size_options(ctx, tight)
     float_modes = ('free', 'head', 'col') if lanes['X'] else ('free',)
@@ -1804,7 +1841,7 @@ def _zones_candidates(ctx, compact=False):
     for g, hf, z1 in itertools.product((g0, g0 * 0.85, max(ctx.gmin, g0 * 0.4)) if tight else (g0,),
                                        (0.88, 0.84, 0.8, 0.65, 0.5) if tight else (0.88, 0.76),
                                        (None, 0.22)):
-        # Left zone: the hero at a showcase height, vertically centred.
+        # Initial left-hero placement; a copy-first variant is also tried below.
         scale = min(hf * ch / max(hero.box[3], 1e-6), 0.3 * cw / max(hero.box[2], 1e-6))
         hb = _scaled_block(ctx, hero, scale)
         if hb is None:
@@ -1855,7 +1892,7 @@ def _zones_candidates(ctx, compact=False):
             kind = 'zones' if fp in ('copy', 'none') else f'zones:fine_{fp}'
             label = (f'zones hero={hf} gutter={g:.0f} z1={z1} fine={fp} badges={bp}/{mode}/k={k} '
                      f'logo={lf} cta={cs} badge={bsz} floaters={fm} copy_split={copy_split}')
-            pre.append((_score(ctx, out, kind), label, out, slotted, kind, (x3 - 0.25 * g, 0.0, cw, ch)))
+            pre.append((_score(ctx, out, kind, organization=False), label, out, slotted, kind, (x3 - 0.25 * g, 0.0, cw, ch)))
             if tight and strip is None:
                 # Also read copy first, then the product beside brand/action.
                 # Reuse the measured copy blocks so this arrangement never
@@ -1867,7 +1904,7 @@ def _zones_candidates(ctx, compact=False):
                 for i, _ in hb.els:
                     moved[i]['x'] += x3 - g - w1 - mh
                 right_label = label + ' hero_side=right'
-                pre.append((_score(ctx, moved, kind), right_label, moved, slotted,
+                pre.append((_score(ctx, moved, kind, organization=False), right_label, moved, slotted,
                             kind, (x3 - 0.25 * g, 0.0, cw, ch)))
     # Floaters and full validation only for the most promising layouts.
     pre.sort(key=lambda t: -t[0])
@@ -1890,25 +1927,19 @@ def _zones_candidates(ctx, compact=False):
             if all(count >= 16 for count in side_counts.values()):
                 break
     if tight and not compact:
-        # Font rasterizers can have different advances even with identical
-        # font files. Only expand the packing search when no normal candidate
-        # meets the copy targets measured by the renderer in this environment.
-        copy = [u for u in copy_units if u.kind == 'text' and u.role in ('headline', 'body')]
-        def readable(out):
-            return all(out[u.text_id]['font_size'] >= min(
-                BANNER_HEADLINE_TARGET - 1 if u.role == 'headline' else ctx.soft['body'],
-                int(ctx.tcap(u.role, u.font))) for u in copy)
-        if copy and not any(readable(out) for _, out, _, _ in results):
-            results += _zones_candidates(ctx, compact=True)
+        # Readable text alone does not prove the first structure is best.
+        # Compare compact/wrapped alternatives under the same final scoring.
+        results += _zones_candidates(ctx, compact=True)
     return results
 
 
 # ---------------- anchored: keep source positions -------------------------
 
 def _build_anchored(ctx):
-    """Scale every unit by the fit ratio and keep its relative position
-    (corner/edge items keep their edge distance). Faithful for identical or
-    nearby ratios; rejected by validation whenever it would collide."""
+    """Start from scaled source positions, preserving edge anchors where possible.
+
+    Clamp blocks and relax small overlaps; the caller still validates the result.
+    """
     k = min(ctx.cw / ctx.sw, ctx.ch / ctx.sh)
     out = {}
     for u in ctx.an.units:
@@ -1936,9 +1967,11 @@ def _build_anchored(ctx):
 
 
 def _relax(ctx, out):
-    """Separate units that merely touch (as loose source boxes often do) by
-    nudging the lower one down -- or the upper one up when there is no room.
-    Large overlaps are left alone for validation to reject."""
+    """Try up to four passes of vertical nudges for small unit-box overlaps.
+
+    Move the lower unit down or the upper one up when it fits. Leave remaining
+    overlaps, including large ones, for candidate validation to reject.
+    """
     units = ctx.an.units
     gap = 2.0
     for _ in range(4):
@@ -2392,7 +2425,7 @@ def _place_panels(ctx, out):
 
 
 def _place_inert(ctx, out):
-    """Invisible elements keep their relative spot, clamped on-canvas."""
+    """Retain empty-text and zero-size source elements with clamped geometry."""
     for i in ctx.an.inert:
         src = ctx.els[i]
         e = dict(src)
@@ -2428,6 +2461,11 @@ def _place_backgrounds(ctx, out):
 # ==========================================================================
 
 def _problems(ctx, out, strict=True):
+    """Check fit using 0.5px bounds/text and 0.25px-squared overlap tolerances.
+
+    Independent-unit collisions use rotated enclosing boxes; intentional
+    layering inside a unit is excluded. Background image ratios are exempt.
+    """
     els = ctx.els
     cw, ch = ctx.cw, ctx.ch
     probs = []
@@ -2472,7 +2510,70 @@ def _collision_area(ctx, out):
     return total + 1e9 * missing
 
 
-def _score(ctx, out, layout_kind):
+@lru_cache(maxsize=8192)
+def _arrangement_cost(boxes, spacing=True):
+    """Disorder of a small related set, allowing either rows or columns.
+
+    Measures alignment and uneven gaps, not absolute location, reading order,
+    or a preferred number of rows. Variable text widths are allowed.
+    """
+    if len(boxes) < 3:
+        return 0.0
+
+    def oriented(transpose):
+        bb = [(y, x, h, w) if transpose else (x, y, w, h) for x, y, w, h in boxes]
+        bands = []
+        for b in sorted(bb, key=lambda b: (b[1] + b[3] / 2, b[0])):
+            for band in bands:
+                if all(abs(b[1] + b[3] / 2 - a[1] - a[3] / 2) <= 0.3 * min(b[3], a[3])
+                       for a in band):
+                    band.append(b)
+                    break
+            else:
+                bands.append([b])
+
+        def alignment(items, axis, size, scale):
+            spread = min(max(b[axis] + anchor * b[size] for b in items) -
+                         min(b[axis] + anchor * b[size] for b in items)
+                         for anchor in (0, 0.5, 1))
+            return min(1.0, max(0.0, spread / max(scale, 1e-6) - 0.15))
+
+        costs = []
+        for band in bands:
+            scale = min(min(b[2], b[3]) for b in band)
+            costs.append(alignment(band, 1, 3, scale))
+            ordered = sorted(band)
+            gaps = [b[0] - a[0] - a[2] for a, b in zip(ordered, ordered[1:])]
+            if spacing and len(gaps) >= 2:
+                costs.append(min(1.0, (max(gaps) - min(gaps)) / max(scale, sum(abs(g) for g in gaps) / len(gaps), 1e-6)))
+        if len(bands) > 1:
+            bounds = [tuple(_union(band)) for band in bands]
+            scale = min(min(b[2], b[3]) for b in bounds)
+            costs.append(alignment(bounds, 0, 2, scale))
+            gaps = [b[1] - a[1] - a[3] for a, b in zip(bounds, bounds[1:])]
+            if spacing and len(gaps) >= 2:
+                costs.append(min(1.0, (max(gaps) - min(gaps)) / max(scale, sum(abs(g) for g in gaps) / len(gaps), 1e-6)))
+        return max(costs, default=0.0)
+
+    return min(oriented(False), oriented(True))
+
+
+def _organization_penalty(ctx, out):
+    """Penalize lost organization only for source-supported related sets."""
+    costs = []
+    for group, source_cost, spacing in ctx.organization_groups:
+        if not all(i in out for ids in group for i in ids):
+            continue
+        boxes = [tuple(_union(_el_box(out[i]) for i in ids)) for ids in group]
+        # Translation-normalize cache keys; relative positions are what matter.
+        ox, oy = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        normalized = tuple((round(x - ox, 2), round(y - oy, 2), round(w, 2), round(h, 2))
+                           for x, y, w, h in boxes)
+        costs.append(max(0.0, _arrangement_cost(normalized, spacing) - source_cost))
+    return ORGANIZATION_WEIGHT * max(costs, default=0.0)
+
+
+def _score(ctx, out, layout_kind, organization=True):
     an = ctx.an
     els = ctx.els
     cw, ch = ctx.cw, ctx.ch
@@ -2516,7 +2617,7 @@ def _score(ctx, out, layout_kind):
             if u.role == 'hero':
                 frac = (bx[2] * bx[3]) / (cw * ch)
                 s -= imp * 1.5 * max(0.0, 0.08 - frac) / 0.08
-    # Hierarchy: a clearly bigger source text must stay bigger.
+    # Penalize hierarchy inversions; this is a preference, not a hard constraint.
     for a in hier:
         for b in hier:
             if a[0] >= 1.3 * b[0] and a[1] < 1.1 * b[1]:
@@ -2536,7 +2637,7 @@ def _score(ctx, out, layout_kind):
         s -= 1.0 * abs(mx - cw / 2) / cw + 0.6 * abs(my - ch / 2) / ch
     s += {'stack_source': 0.25, 'stack_lanes': 0.0, 'columns': 0.0, 'fallback': -5.0}.get(layout_kind, 0.0)
     if layout_kind == 'anchored':
-        # Fidelity: at the source's own ratio, the source layout is the answer.
+        # Favor source-based placement when the aspect ratio changes little.
         drift = abs(math.log(ctx.aspect / ctx.src_aspect))
         s += 1.5 * max(0.0, 1.0 - drift / 0.3)
     if 'inline' in layout_kind:
@@ -2547,7 +2648,7 @@ def _score(ctx, out, layout_kind):
         s += 2.0    # on strips, the designed three-zone composition is preferred
         # Fine print belongs under the subhead; elsewhere it is a compromise.
         s -= {'zones:fine_strip': 0.3, 'zones:fine_right': 0.8}.get(layout_kind, 0.0)
-    return s
+    return s - (_organization_penalty(ctx, out) if organization else 0.0)
 
 
 def _banner_terms(ctx, out):
@@ -2601,11 +2702,11 @@ def _banner_terms(ctx, out):
             if frac < 0.8:
                 s -= 2.0 * (0.8 - frac) / 0.8
         elif u.role == 'logo' and tight:
-            # The brand mark must read: visible logo height ~30% of the strip.
+            # Prefer visible logo height near 30% of the strip; smaller is allowed.
             box = _union(_el_box(out[i]) for i in u.ids)
             visible = box[3] * (u.visible[3] - u.visible[1])
             s -= 0.15 * max(0.0, 0.3 * ctx.ch - visible)
-    # Nothing floats right beside the CTA: side-by-side neighbours crowd it.
+    # Penalize floaters close beside the CTA; this does not forbid placement.
     ctas = [_union(_el_box(out[i]) for i in u.ids) for u in ctx.an.units
             if u.role == 'cta' and all(i in out for i in u.ids)]
     for u in ctx.lanes['X']:
@@ -2643,7 +2744,7 @@ def _banner_terms(ctx, out):
 # ==========================================================================
 
 def _fallback(ctx):
-    """Uniformly scaled copy of the source, centred. Always in bounds."""
+    """Propose scaled source units in a centred frame; repair/validation follow."""
     k = min(ctx.cw / ctx.sw, ctx.ch / ctx.sh)
     ox = (ctx.cw - ctx.sw * k) / 2
     oy = (ctx.ch - ctx.sh * k) / 2
@@ -2657,8 +2758,10 @@ def _fallback(ctx):
 
 
 def _grid_fallback(ctx):
-    """Collision-free last resort: units in reading order, one per cell of a
-    grid shaped like the canvas, each scaled to fit its cell."""
+    """Propose a reading-order grid with one scaled unit per cell.
+
+    Text refitting can change block extents, so repair/validation are required.
+    """
     units = ctx.an.units
     n = len(units)
     if not n:
@@ -2689,7 +2792,10 @@ def _grid_fallback(ctx):
 
 
 def _repair(ctx, out):
-    """Last line of defence: every element on canvas, every text fitting."""
+    """Adjust text fit, size, bounds and rounding; callers must validate afterward.
+
+    This pass can introduce unit collisions and cannot guarantee a valid layout.
+    """
     cw, ch = ctx.cw, ctx.ch
     for i, e in list(out.items()):
         e = dict(e)
@@ -2766,8 +2872,9 @@ class LayoutValidationError(ValueError):
 def _final_problems(ctx, out):
     """Validate geometry and preserved fields on the actual returned elements.
 
-    Keep the existing background fit/rotation policy; this gate does not
-    introduce new asset or typography permissions.
+    Check index coverage, preserved fields, finite geometry, font sizes and
+    line limits as well as _problems' fit checks and tolerances. Background
+    fit/rotation changes are allowed by the existing placement policy.
     """
     problems = []
     if set(out) != set(range(len(ctx.els))):
@@ -2807,8 +2914,9 @@ def _final_problems(ctx, out):
 def _review_and_repair(ctx, out, rounds=3):
     """Repair fit, then resolve collisions by translating whole layout units.
 
-    At most three greedy rounds, eight collisions per round, and eight edge
-    moves per collision. Every accepted move strictly improves diagnostics.
+    By default, try three greedy rounds with up to eight collisions per round
+    and eight edge moves per collision. Accepted moves strictly improve the
+    problem-count/collision-area pair; this does not guarantee convergence.
     Inputs are never mutated; content, sizes and group-relative positions
     remain fixed during collision repair.
     """
@@ -2844,28 +2952,64 @@ def _review_and_repair(ctx, out, rounds=3):
 
 
 def _select_reviewed(ctx, candidates):
-    """Preserve score order for valid layouts; only repair rejected runners-up."""
+    """Finalize valid candidates, then apply readability and organization policy.
+
+    If none passes, try bounded collision recovery on six rejected candidates.
+    """
     valid, rejected = [], []
     for kind, full, label in candidates:
         problems = _problems(ctx, full)
         if problems:
             rejected.append((len(problems), _collision_area(ctx, full), kind, full))
         else:
-            sc = _score(ctx, full, kind)
+            sc = _score(ctx, full, kind, organization=False)
             valid.append((sc, full))
             if _DEBUG is not None:
                 _DEBUG.append((sc, f'{label} floors={ctx.floor_mult}', full))
-    for _, full in sorted(valid, key=lambda item: -item[0]):
+    finished_valid = []
+    for sc, full in sorted(valid, key=lambda item: -item[0]):
         finished, problems = _review_and_repair(ctx, full, rounds=0)
         if not problems:
-            return finished
-        rejected.append((len(problems), _collision_area(ctx, finished), '', finished))
+            finished_valid.append((sc, finished))
+        else:
+            rejected.append((len(problems), _collision_area(ctx, finished), '', finished))
+    if finished_valid:
+        return _pick_organized(ctx, finished_valid)
     repaired = []
     for _, _, kind, full in sorted(rejected, key=lambda item: item[:2])[:6]:
         finished, problems = _review_and_repair(ctx, full)
         if not problems:
-            repaired.append((_score(ctx, finished, kind), finished))
-    return max(repaired, key=lambda item: item[0])[1] if repaired else None
+            repaired.append((_score(ctx, finished, kind, organization=False), finished))
+    return _pick_organized(ctx, repaired) if repaired else None
+
+
+def _pick_organized(ctx, candidates):
+    """Apply organization penalties among candidates preserving text preferences.
+
+    Use the supplied base scores to choose the readability reference.
+    """
+    reference = max(candidates, key=lambda item: item[0])[1]
+    eligible = [(sc - _organization_penalty(ctx, full), full) for sc, full in candidates
+                if _no_worse_readability(ctx, reference, full)]
+    return max(eligible, key=lambda item: item[0])[1]
+
+
+def _no_worse_readability(ctx, reference, candidate):
+    """Organization cannot increase any text unit's preferred-size shortfall.
+
+    The reference is the best valid candidate under the existing score, so
+    this requires no sample-specific sizes or positions. Sizes above their
+    preference remain free to trade off against organization.
+    """
+    for u in ctx.an.units:
+        if u.kind not in ('text', 'pill'):
+            continue
+        target = min(ctx.soft.get(u.role, 8), ctx.tcap(u.role, u.font))
+        a = max(0, target - reference[u.text_id]['font_size'])
+        b = max(0, target - candidate[u.text_id]['font_size'])
+        if b > a + 1e-6:
+            return False
+    return True
 
 
 def _candidates(ctx):
@@ -2973,19 +3117,24 @@ def _complete(ctx, out, kind=''):
     out = _place_panels(ctx, out)
     out = _place_backgrounds(ctx, out)
     out = _place_inert(ctx, out)
-    # In the anchored layout every unit sits where the designer put it, so the
-    # source's decorative layering is reproduced as-is (clamped on-canvas).
+    # Anchored candidates retain source-based decorative anchors, clamped to
+    # the canvas, rather than searching other decorative positions.
     out = _place_decorations(ctx, out, keep_layering=(kind == 'anchored'))
     return out
 
 
 # Development hook (tools/debug_candidates.py): set to a list to collect
-# (score, label, layout) for every validated candidate. Unused in production.
+# (base score, label, pre-repair layout) for candidates passing _problems.
+# These are not final organization-adjusted rankings. Unused in production.
 _DEBUG = None
 
 
 def resize(source, target_canvas):
-    """Return the source design re-laid-out for `target_canvas`."""
+    """Return a validated reflow, or raise LayoutValidationError if search fails.
+
+    Preserve source element IDs/count/order. Nonpositive canvas dimensions
+    raise ValueError before layout search.
+    """
     cw, ch = int(target_canvas['width']), int(target_canvas['height'])
     if cw <= 0 or ch <= 0:
         raise ValueError('Canvas dimensions must be positive')
